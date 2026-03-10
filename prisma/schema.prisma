@@ -1,0 +1,79 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Project {
+  id              String   @id @default(uuid())
+  clientName      String
+  roomType        String
+  ceilingHeightIn Float
+  closetDepthIn   Float
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  walls Wall[]
+}
+
+model Wall {
+  id        String  @id @default(uuid())
+  label     String
+  widthIn   Float
+  sortOrder Int
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id])
+
+  returnWalls  ReturnWall[]
+  doorOpenings DoorOpening[]
+  obstacles    Obstacle[]
+  designZones  DesignZone[]
+}
+
+model ReturnWall {
+  id          String  @id @default(uuid())
+  side        String
+  depthIn     Float
+  clearanceIn Float
+
+  wallId String
+  wall   Wall @relation(fields: [wallId], references: [id])
+}
+
+model DoorOpening {
+  id                 String  @id @default(uuid())
+  positionFromLeftIn Float
+  widthIn            Float
+  heightIn           Float
+
+  wallId String
+  wall   Wall @relation(fields: [wallId], references: [id])
+}
+
+model Obstacle {
+  id                 String  @id @default(uuid())
+  type               String
+  positionFromLeftIn Float
+  widthIn            Float
+  heightFromFloorIn  Float
+  obstacleHeightIn   Float
+
+  wallId String
+  wall   Wall @relation(fields: [wallId], references: [id])
+}
+
+model DesignZone {
+  id            String  @id @default(uuid())
+  startIn       Float
+  endIn         Float
+  usableWidthIn Float
+  maxHeightIn   Float
+  sortOrder     Int
+
+  wallId String
+  wall   Wall @relation(fields: [wallId], references: [id])
+}

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd C:/Users/ilham/closet-saas && npx tsc --noEmit 2>&1 | head -60)",
+      "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -30)",
+      "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -25)",
+      "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -20)"
+    ]
+  }
+}
