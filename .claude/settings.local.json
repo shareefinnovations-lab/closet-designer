@@ -6,7 +6,8 @@
       "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -25)",
       "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -20)",
       "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -15)",
-      "Bash(gh auth status 2>&1)"
+      "Bash(gh auth status 2>&1)",
+      "Bash(npm run:*)"
     ]
   }
 }

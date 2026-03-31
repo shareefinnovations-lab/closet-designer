@@ -27,4 +27,5 @@ export interface Config {
   closetDepthIn:   number;
   leftReturnIn:    number;
   rightReturnIn:   number;
+  remarks:         string;
 }

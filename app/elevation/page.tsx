@@ -2,9 +2,8 @@
 // app/elevation/page.tsx
 //
 // Closet Designer — Front View + Top View.
-// Components (Shelf, Rod, DrawerStack) are draggable in the front view.
-// Each drawer in a stack has its own editable height.
-// Components snap to 1" grid and cannot overlap each other or lock shelves.
+// Loads config from localStorage["closet-setup"]; redirects to /setup if missing.
+// Restores and auto-saves design state via localStorage["closet-design"].
 
 import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
@@ -19,36 +18,123 @@ import {
 } from "./_lib/helpers";
 import type { View, ComponentType, ClosetComponent, Section, Config } from "./_lib/types";
 
-import { SetupScreen }    from "./_components/SetupScreen";
 import { DesignerHeader } from "./_components/DesignerHeader";
 import { FrontView }      from "./_components/FrontView";
 import { TopView }        from "./_components/TopView";
 import { SectionCards }   from "./_components/SectionCards";
 import { SectionEditor }  from "./_components/SectionEditor";
 
-// ─── Designer Workspace ───────────────────────────────────────────────────────
+// ─── Saved design shape ───────────────────────────────────────────────────────
 
-function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup: () => void }) {
-  const router       = useRouter();
+interface SavedDesign {
+  config:       Config;
+  sections:     Section[];
+  panelHeights: number[];
+  ceilingH:     number;
+}
+
+// ─── Designer Page ────────────────────────────────────────────────────────────
+
+export default function ElevationPage() {
+  const router = useRouter();
+
+  // ── Bootstrap from localStorage ──────────────────────────────────────────────
+  // null  = not yet loaded (avoids flash)
+  // false = loaded but missing → redirect
+  const [config,       setConfig]       = useState<Config | null>(null);
+  const [ready,        setReady]        = useState(false);   // true once localStorage is read
+
+  // Design state — initialised after localStorage read
+  const [sections,      setSections]      = useState<Section[]>([]);
+  const [panelHeights,  setPanelHeights]  = useState<number[]>([]);
+  const [ceilingH,      setCeilingH]      = useState(101);
+
+  const nextId = useRef(1);
+  const svgRef = useRef<SVGSVGElement>(null);
+
+  useEffect(() => {
+    const rawSetup  = localStorage.getItem("closet-setup");
+    const rawDesign = localStorage.getItem("closet-design");
+
+    if (!rawSetup) {
+      router.replace("/setup");
+      return;
+    }
+
+    try {
+      const cfg = JSON.parse(rawSetup) as Config;
+      setConfig(cfg);
+
+      if (rawDesign) {
+        // Restore saved design state
+        const saved = JSON.parse(rawDesign) as Partial<SavedDesign>;
+        setSections(saved.sections     ?? makeInitialSections(cfg.wallWidthIn));
+        setPanelHeights(saved.panelHeights ?? Array.from({ length: 4 }, () => defaultPanelHeight(cfg.ceilingHeightIn)));
+        setCeilingH(saved.ceilingH     ?? cfg.ceilingHeightIn);
+      } else {
+        // No design yet — use defaults
+        setSections(makeInitialSections(cfg.wallWidthIn));
+        setPanelHeights(Array.from({ length: 4 }, () => defaultPanelHeight(cfg.ceilingHeightIn)));
+        setCeilingH(cfg.ceilingHeightIn);
+      }
+
+      setReady(true);
+    } catch {
+      // Corrupt data — send back to setup
+      router.replace("/setup");
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Auto-save design state whenever sections / panelHeights / ceilingH change
+  useEffect(() => {
+    if (!ready || !config) return;
+    const payload: SavedDesign = { config, sections, panelHeights, ceilingH };
+    localStorage.setItem("closet-design", JSON.stringify(payload));
+  }, [sections, panelHeights, ceilingH, ready]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── View toggle ───────────────────────────────────────────────────────────────
+  const [view, setView] = useState<View>("front");
+
+  // ── Section selection ─────────────────────────────────────────────────────────
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+
+  // ── Drag state ────────────────────────────────────────────────────────────────
+  const [drag, setDrag] = useState<{
+    compId: number; secIdx: number; startClientY: number; startPosIn: number;
+  } | null>(null);
+
+  // ── Drag mouse handlers ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!drag) return;
+    const d = drag;
+    function onMove(e: MouseEvent) {
+      updateComponentPosition(d.secIdx, d.compId, d.startPosIn + (e.clientY - d.startClientY) / SCALE);
+    }
+    function onUp() { setDrag(null); }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup",   onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup",   onUp);
+    };
+  }, [drag]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Loading / redirect guard ──────────────────────────────────────────────────
+  if (!ready || !config) {
+    return (
+      <div style={{ fontFamily: "sans-serif", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", backgroundColor: "#f5f2ee" }}>
+        <p style={{ color: "#aaa", fontSize: "14px" }}>Loading…</p>
+      </div>
+    );
+  }
+
+  // ── Derived from config ───────────────────────────────────────────────────────
   const wallW        = config.wallWidthIn;
   const overallDepth = config.closetDepthIn;
   const leftReturn   = config.leftReturnIn;
   const rightReturn  = config.rightReturnIn;
 
-  const nextId = useRef(1);
-  const svgRef = useRef<SVGSVGElement>(null);
-
-  function handleContinueToWorksheet() {
-    localStorage.setItem("closet-design", JSON.stringify({ config, sections }));
-    router.push("/worksheet");
-  }
-
-  // ── Height settings ──────────────────────────────────────────────────────────
-  const [ceilingH, setCeilingH]         = useState(config.ceilingHeightIn);
-  const [panelHeights, setPanelHeights] = useState<number[]>(() =>
-    Array.from({ length: 4 }, () => defaultPanelHeight(config.ceilingHeightIn))
-  );
-
+  // ── Height helpers ────────────────────────────────────────────────────────────
   function clampPanel(h: number): number {
     return Math.min(Math.max(1, h), ceilingH);
   }
@@ -63,23 +149,20 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
   }
   const ceilingHpx = ceilingH * SCALE;
 
-  // ── View toggle ──────────────────────────────────────────────────────────────
-  const [view, setView] = useState<View>("front");
-
-  // ── Section state ────────────────────────────────────────────────────────────
-  const [sections, setSections]       = useState<Section[]>(() => makeInitialSections(wallW));
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  // ── Derived ───────────────────────────────────────────────────────────────────
   const selectedSection = selectedIndex !== null ? sections[selectedIndex] : null;
 
-  // ── Drag state ───────────────────────────────────────────────────────────────
-  const [drag, setDrag] = useState<{
-    compId: number;
-    secIdx: number;
-    startClientY: number;
-    startPosIn: number;
-  } | null>(null);
+  // ── Navigation ────────────────────────────────────────────────────────────────
+  function handleBackToSetup() {
+    router.push("/setup");
+  }
 
-  // ── Section handlers ─────────────────────────────────────────────────────────
+  function handleContinueToWorksheet() {
+    // Design is already auto-saved; just navigate
+    router.push("/worksheet");
+  }
+
+  // ── Section handlers ──────────────────────────────────────────────────────────
 
   function handleAddSection() {
     setSections(prev => rebalance([...prev, { widthIn: 0, depthIn: defaultSectionDepth(), components: [] }], wallW));
@@ -122,7 +205,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
     setSelectedIndex(prev => prev === index ? null : index);
   }
 
-  // ── Component handlers ───────────────────────────────────────────────────────
+  // ── Component handlers ────────────────────────────────────────────────────────
 
   function handleAddComponent(type: ComponentType) {
     if (selectedIndex === null) return;
@@ -145,9 +228,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
       prev.map((s, i) => {
         if (i !== selectedIndex) return s;
         const newComponents = [...s.components, comp];
-        const newDepth = type === "DrawerStack"
-          ? Math.max(s.depthIn, DRAWER_MIN_DEPTH)
-          : s.depthIn;
+        const newDepth = type === "DrawerStack" ? Math.max(s.depthIn, DRAWER_MIN_DEPTH) : s.depthIn;
         return { ...s, components: newComponents, depthIn: newDepth };
       })
     );
@@ -159,8 +240,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
       prev.map((s, i) => {
         if (i !== selectedIndex) return s;
         const newComponents = s.components.filter(c => c.id !== compId);
-        const newDepth = minDepthFor(newComponents);
-        return { ...s, components: newComponents, depthIn: newDepth };
+        return { ...s, components: newComponents, depthIn: minDepthFor(newComponents) };
       })
     );
   }
@@ -171,30 +251,23 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
         if (si !== secIdx) return s;
         const comp = s.components.find(c => c.id === compId);
         if (!comp) return s;
-        const sectionH = getSectionHeight(si);
-        const newPos   = resolvePosition(comp, sectionH, rawPosIn, s.components);
-        return {
-          ...s,
-          components: s.components.map(c => c.id === compId ? { ...c, positionIn: newPos } : c)
-        };
+        const newPos = resolvePosition(comp, getSectionHeight(si), rawPosIn, s.components);
+        return { ...s, components: s.components.map(c => c.id === compId ? { ...c, positionIn: newPos } : c) };
       })
     );
   }
 
-  // ── Drawer-specific handlers ─────────────────────────────────────────────────
+  // ── Drawer handlers ───────────────────────────────────────────────────────────
 
   function handleAddDrawer(compId: number) {
     if (selectedIndex === null) return;
     setSections(prev =>
       prev.map((s, si) => {
         if (si !== selectedIndex) return s;
-        return {
-          ...s,
-          components: s.components.map(c => {
-            if (c.id !== compId || c.type !== "DrawerStack") return c;
-            return { ...c, drawerHeights: [...c.drawerHeights, 10] };
-          })
-        };
+        return { ...s, components: s.components.map(c =>
+          c.id === compId && c.type === "DrawerStack"
+            ? { ...c, drawerHeights: [...c.drawerHeights, 10] } : c
+        )};
       })
     );
   }
@@ -204,13 +277,10 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
     setSections(prev =>
       prev.map((s, si) => {
         if (si !== selectedIndex) return s;
-        return {
-          ...s,
-          components: s.components.map(c => {
-            if (c.id !== compId || c.type !== "DrawerStack" || c.drawerHeights.length <= 1) return c;
-            return { ...c, drawerHeights: c.drawerHeights.slice(0, -1) };
-          })
-        };
+        return { ...s, components: s.components.map(c =>
+          c.id === compId && c.type === "DrawerStack" && c.drawerHeights.length > 1
+            ? { ...c, drawerHeights: c.drawerHeights.slice(0, -1) } : c
+        )};
       })
     );
   }
@@ -221,72 +291,43 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
     setSections(prev =>
       prev.map((s, si) => {
         if (si !== selectedIndex) return s;
-        return {
-          ...s,
-          components: s.components.map(c => {
-            if (c.id !== compId || c.type !== "DrawerStack") return c;
-            const newHeights = c.drawerHeights.map((h, i) => i === drawerIdx ? newH : h);
-            return { ...c, drawerHeights: newHeights };
-          })
-        };
+        return { ...s, components: s.components.map(c =>
+          c.id === compId && c.type === "DrawerStack"
+            ? { ...c, drawerHeights: c.drawerHeights.map((h, i) => i === drawerIdx ? newH : h) } : c
+        )};
       })
     );
   }
 
-  // ── Drag handlers ────────────────────────────────────────────────────────────
+  // ── Drag handlers ─────────────────────────────────────────────────────────────
 
   function handleStartDrag(secIdx: number, compId: number, clientY: number, positionIn: number) {
     setDrag({ compId, secIdx, startClientY: clientY, startPosIn: positionIn });
   }
 
-  // Window-level drag tracking — attached only while a drag is active.
-  useEffect(() => {
-    if (!drag) return;
-    const d = drag;
-
-    function onMove(e: MouseEvent) {
-      const deltaIn = (e.clientY - d.startClientY) / SCALE;
-      updateComponentPosition(d.secIdx, d.compId, d.startPosIn + deltaIn);
-    }
-    function onUp() { setDrag(null); }
-
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup",   onUp);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup",   onUp);
-    };
-  }, [drag]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Derived SVG values ───────────────────────────────────────────────────────
+  // ── Derived SVG values ────────────────────────────────────────────────────────
 
   const wallWpx = wallW * SCALE;
   const wx      = PAD_LEFT;
 
   const sectionStartXs: number[] = [];
   let cumX = wx;
-  for (const s of sections) {
-    sectionStartXs.push(cumX);
-    cumX += s.widthIn * SCALE;
-  }
+  for (const s of sections) { sectionStartXs.push(cumX); cumX += s.widthIn * SCALE; }
 
   const totalWidthIn = sections.reduce((sum, s) => sum + s.widthIn, 0);
   const isValid      = totalWidthIn === wallW;
 
-  // ── Render ───────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────────
   return (
     <div style={{ fontFamily: "sans-serif", padding: "40px", maxWidth: "700px", margin: "0 auto" }}>
 
       {/* ── Top nav ───────────────────────────────────────────────────────── */}
       <div style={{ marginBottom: "20px" }}>
-        <button
-          onClick={onBackToSetup}
-          style={{
-            padding: "7px 16px", fontSize: "13px", fontWeight: "600",
-            backgroundColor: "#fff", color: "#444",
-            border: "1px solid #ccc", borderRadius: "7px", cursor: "pointer",
-          }}
-        >
+        <button onClick={handleBackToSetup} style={{
+          padding: "7px 16px", fontSize: "13px", fontWeight: "600",
+          backgroundColor: "#fff", color: "#444",
+          border: "1px solid #ccc", borderRadius: "7px", cursor: "pointer",
+        }}>
           ← Back to Setup
         </button>
       </div>
@@ -299,6 +340,13 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
         rightReturn={rightReturn}
       />
 
+      {/* ── Remarks badge (if present) ────────────────────────────────────── */}
+      {config.remarks && (
+        <div style={{ fontSize: "12px", color: "#5a7a5a", backgroundColor: "#f0f7f0", border: "1px solid #c8e0c8", borderRadius: "6px", padding: "8px 12px", marginBottom: "20px" }}>
+          <strong>Client notes:</strong> {config.remarks}
+        </div>
+      )}
+
       {/* ── Height Settings ───────────────────────────────────────────────── */}
       <div style={{ padding: "16px 18px", backgroundColor: "#f7f5f2", border: "1px solid #e0dbd4", borderRadius: "8px", marginBottom: "20px" }}>
         <div style={{ marginBottom: "14px" }}>
@@ -309,9 +357,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
               style={{ width: "90px", padding: "5px 8px", fontSize: "14px", border: "1px solid #ccc", borderRadius: "4px", color: "#111" }} />
           </label>
         </div>
-        <div style={{ fontSize: "12px", fontWeight: "700", color: "#333", marginBottom: "8px" }}>
-          Panel Heights (in)
-        </div>
+        <div style={{ fontSize: "12px", fontWeight: "700", color: "#333", marginBottom: "8px" }}>Panel Heights (in)</div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: "10px" }}>
           {panelHeights.map((ph, i) => {
             const clamped = Math.min(ph, ceilingH);
@@ -340,7 +386,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
         ))}
       </div>
 
-      {/* ── Component Editor (front view, section selected) ───────────────── */}
+      {/* ── Section Editor ────────────────────────────────────────────────── */}
       {view === "front" && selectedSection && selectedIndex !== null && (
         <SectionEditor
           selectedIndex={selectedIndex}
@@ -358,7 +404,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
         />
       )}
 
-      {/* ── Section Configuration Panel ────────────────────────────────────── */}
+      {/* ── Section Cards ─────────────────────────────────────────────────── */}
       <SectionCards
         sections={sections}
         selectedIndex={selectedIndex}
@@ -376,7 +422,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
         {view === "front" && <span style={{ color: "#555" }}>&nbsp;&middot;&nbsp; Click a section to configure</span>}
       </p>
 
-      {/* ── Front View ───────────────────────────────────────────────────── */}
+      {/* ── Front View ────────────────────────────────────────────────────── */}
       {view === "front" && (
         <FrontView
           sections={sections}
@@ -393,7 +439,7 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
         />
       )}
 
-      {/* ── Top View ───────────────────────────────────────────────────────── */}
+      {/* ── Top View ──────────────────────────────────────────────────────── */}
       {view === "top" && (
         <TopView
           sections={sections}
@@ -406,29 +452,18 @@ function DesignerPage({ config, onBackToSetup }: { config: Config; onBackToSetup
         />
       )}
 
-      {/* ── Continue to Worksheet ──────────────────────────────────────────── */}
+      {/* ── Continue to Worksheet ─────────────────────────────────────────── */}
       <div style={{ marginTop: "32px", display: "flex", justifyContent: "flex-end" }}>
-        <button
-          onClick={handleContinueToWorksheet}
-          style={{
-            padding: "12px 28px", fontSize: "14px", fontWeight: "700",
-            backgroundColor: "#1a1a1a", color: "#fff",
-            border: "none", borderRadius: "8px", cursor: "pointer",
-            letterSpacing: "0.3px",
-          }}
-        >
+        <button onClick={handleContinueToWorksheet} style={{
+          padding: "12px 28px", fontSize: "14px", fontWeight: "700",
+          backgroundColor: "#1a1a1a", color: "#fff",
+          border: "none", borderRadius: "8px", cursor: "pointer",
+          letterSpacing: "0.3px",
+        }}>
           Continue to Worksheet →
         </button>
       </div>
 
     </div>
   );
-}
-
-// ─── App Entry Point ──────────────────────────────────────────────────────────
-
-export default function ElevationPage() {
-  const [config, setConfig] = useState<Config | null>(null);
-  if (!config) return <SetupScreen onStart={setConfig} />;
-  return <DesignerPage config={config} onBackToSetup={() => setConfig(null)} />;
 }
