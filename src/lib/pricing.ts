@@ -79,26 +79,26 @@ export function computePricing(
 
   // ── 1. Panels ──────────────────────────────────────────────────────────────
   // There are (sections.length + 1) vertical panels total.
-  // - Outer left panel: uses overallDepthIn
-  // - Outer right panel: uses overallDepthIn
-  // - Each inner panel (between two sections): uses max depth of its two neighbors
+  // - Outer left panel:  uses sections[0].depthIn
+  // - Outer right panel: uses sections[N-1].depthIn
+  // - Each inner panel:  uses max depth of its two neighboring sections
   //
   // Group panels by price tier and emit separate line items per tier.
 
   const panelDepths: number[] = [];
 
-  // Left outer panel
-  panelDepths.push(overallDepthIn);
-  // Inner panels
+  // Left outer panel — uses the leftmost section's actual depth
+  panelDepths.push(sections[0].depthIn);
+  // Inner panels — use max depth of the two sections they separate
   for (let i = 0; i < sections.length - 1; i++) {
     panelDepths.push(Math.max(sections[i].depthIn, sections[i + 1].depthIn));
   }
-  // Right outer panel
-  panelDepths.push(overallDepthIn);
+  // Right outer panel — uses the rightmost section's actual depth
+  panelDepths.push(sections[sections.length - 1].depthIn);
 
-  // Check for depth > 16"
+  // Check for overall depth > 16"
   if (overallDepthIn > 16) {
-    warnings.push(`Overall depth (${overallDepthIn}") exceeds 16" — panels priced at 16" rate. Verify with supplier.`);
+    warnings.push(`Overall depth (${overallDepthIn}") exceeds 16" — verify panel depth with supplier.`);
   }
 
   const panels12 = panelDepths.filter(d => depthBucket(d) === 12).length;

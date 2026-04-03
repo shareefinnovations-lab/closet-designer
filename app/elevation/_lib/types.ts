@@ -28,4 +28,5 @@ export interface Config {
   leftReturnIn:    number;
   rightReturnIn:   number;
   remarks:         string;
+  projectType?:    string;  // set from dashboard: Reach-In Closet, Walk-In Closet, Garage, etc.
 }

@@ -1,21 +1,19 @@
 "use client";
-// app/worksheet/page.tsx
+// app/worksheet/page.tsx — Multi-wall pricing worksheet (v2)
 //
-// Internal pricing worksheet.
-// Reads design state from localStorage["closet-design"], computes pricing,
-// and presents a clean line-item sheet for internal use.
+// Reads design-state (all walls) + room-layout from localStorage.
+// Computes per-wall and combined internal pricing using the 11% adjustment engine.
+// Internal use only — leads to the client-facing presentation page.
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { computePricing, ADJUSTMENT_RATE, type PricingResult } from "@/src/lib/pricing";
-import type { Config, Section } from "@/app/elevation/_lib/types";
+import { ADJUSTMENT_RATE } from "@/src/lib/pricing";
+import { computeWallWorksheet } from "@/src/lib/wall-pricing";
+import type { WallWorksheetResult, DesignStateV2 } from "@/src/lib/wall-pricing";
+import type { RoomLayout } from "@/app/_lib/room-types";
+import { getSelectedWalls } from "@/app/_lib/room-types";
 
-interface DesignData {
-  config: Config;
-  sections: Section[];
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Formatters ───────────────────────────────────────────────────────────────
 
 function fmt(n: number): string {
   return n.toLocaleString("en-US", {
@@ -31,45 +29,69 @@ function fmtDec(n: number): string {
   });
 }
 
-// ─── Worksheet ────────────────────────────────────────────────────────────────
+// ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function WorksheetPage() {
   const router = useRouter();
-  const [data,   setData]   = useState<DesignData | null>(null);
-  const [result, setResult] = useState<PricingResult | null>(null);
-  const [error,  setError]  = useState<string | null>(null);
+
+  const [layout,  setLayout]  = useState<RoomLayout | null>(null);
+  const [results, setResults] = useState<WallWorksheetResult[]>([]);
+  const [error,   setError]   = useState<string | null>(null);
 
   useEffect(() => {
-    const raw = localStorage.getItem("closet-design");
-    if (!raw) {
+    const rawLayout = localStorage.getItem("room-layout");
+    const rawState  = localStorage.getItem("design-state");
+
+    if (!rawLayout) {
+      setError("No room layout found. Please complete the room layout first.");
+      return;
+    }
+    if (!rawState) {
       setError("No design found. Please complete the design first.");
       return;
     }
+
     try {
-      const parsed = JSON.parse(raw) as DesignData;
-      const pricingSections = parsed.sections.map(s => ({
-        widthIn: s.widthIn,
-        depthIn: s.depthIn,
-        components: s.components.map(c => ({
-          type: c.type,
-          drawerHeights: c.drawerHeights,
-        })),
-      }));
-      const pricing = computePricing(pricingSections, parsed.config.closetDepthIn);
-      setData(parsed);
-      setResult(pricing);
+      const layout      = JSON.parse(rawLayout) as RoomLayout;
+      const designState = JSON.parse(rawState)  as DesignStateV2;
+
+      if (designState.v !== 2 || !Array.isArray(designState.runs)) {
+        setError("Design data format is not recognized. Please go back and re-save your design.");
+        return;
+      }
+
+      const selectedWalls = getSelectedWalls(layout);
+      const sysH          = layout.systemHeightIn;
+      const overallDepth  = layout.closetDepthIn;
+
+      // Build a result for every wall that has sections designed
+      const wallResults: WallWorksheetResult[] = [];
+      for (let idx = 0; idx < selectedWalls.length; idx++) {
+        const wall  = selectedWalls[idx];
+        const run   = designState.runs.find(r => r.wallId === wall.id);
+        const label = `Wall ${String.fromCharCode(65 + idx)}`; // A, B, C…
+
+        if (!run || run.sections.length === 0) continue;
+
+        wallResults.push(
+          computeWallWorksheet(run, label, overallDepth, sysH)
+        );
+      }
+
+      setLayout(layout);
+      setResults(wallResults);
     } catch {
-      setError("Design data could not be read. Please go back and try again.");
+      setError("Could not read design data. Please go back and try again.");
     }
   }, []);
 
   // ── Error state ──────────────────────────────────────────────────────────────
   if (error) {
     return (
-      <div style={styles.page}>
+      <div style={S.page}>
         <div style={{ textAlign: "center", paddingTop: "80px" }}>
           <p style={{ fontSize: "15px", color: "#b91c1c", marginBottom: "24px" }}>{error}</p>
-          <button onClick={() => router.push("/elevation")} style={styles.btnBack}>
+          <button onClick={() => router.push("/design")} style={S.btnBack}>
             ← Back to Design
           </button>
         </div>
@@ -78,133 +100,203 @@ export default function WorksheetPage() {
   }
 
   // ── Loading state ────────────────────────────────────────────────────────────
-  if (!data || !result) {
+  if (!layout) {
     return (
-      <div style={styles.page}>
+      <div style={S.page}>
         <p style={{ color: "#888", paddingTop: "80px", textAlign: "center" }}>Loading…</p>
       </div>
     );
   }
 
-  const { config, sections } = data;
-  const { lineItems, subtotal, adjustment, total, warnings } = result;
-
-  // Counts for summary header
-  const panelCount  = sections.length + 1;
-  const sectionSummary = sections.map((s, i) => `S${i + 1}: ${s.widthIn}"`).join(" · ");
+  // ── Combined totals ───────────────────────────────────────────────────────────
+  const combinedSubtotal   = results.reduce((s, r) => s + r.pricing.subtotal,   0);
+  const combinedAdjustment = results.reduce((s, r) => s + r.pricing.adjustment, 0);
+  const combinedTotal      = results.reduce((s, r) => s + r.pricing.total,      0);
+  const combinedPanels     = results.reduce((s, r) => s + r.panelCount,         0);
+  const combinedShelves    = results.reduce((s, r) => s + r.shelfCount,         0);
+  const combinedRods       = results.reduce((s, r) => s + r.rodCount,           0);
+  const combinedDrawers    = results.reduce((s, r) => s + r.drawerCount,        0);
 
   return (
-    <div style={styles.page}>
-      <div style={styles.sheet}>
+    <div style={S.page}>
+      <div style={S.sheet}>
 
         {/* ── Header ──────────────────────────────────────────────────────── */}
-        <div style={styles.header}>
+        <div style={S.header}>
           <div>
-            <h1 style={styles.h1}>Pricing Worksheet</h1>
-            <p style={styles.subtitle}>Internal use only</p>
+            <h1 style={S.h1}>Pricing Worksheet</h1>
+            <p style={S.subtitle}>Internal use only</p>
           </div>
           <div style={{ display: "flex", gap: "10px" }}>
-            <button onClick={() => router.push("/elevation")} style={styles.btnBack}>
+            <button onClick={() => router.push("/design")} style={S.btnBack}>
               ← Back to Design
             </button>
-            <button onClick={() => router.push("/presentation")} style={styles.btnNext}>
-              Continue to Price Presentation →
+            <button onClick={() => router.push("/design-preview")} style={S.btnNext}>
+              Design Preview →
             </button>
           </div>
         </div>
 
         {/* ── Client Info ─────────────────────────────────────────────────── */}
-        <div style={styles.infoGrid}>
-          <InfoRow label="Client Name" value={config.clientName || "—"} />
-          <InfoRow label="Client #"    value={config.clientNum  || "—"} />
-          <InfoRow label="Location"    value={config.locationName || "—"} />
-          <InfoRow label="Wall Width"  value={`${config.wallWidthIn}"`} />
-          <InfoRow label="Ceiling Ht." value={`${config.ceilingHeightIn}"`} />
-          <InfoRow label="Overall Depth" value={`${config.closetDepthIn}"`} />
+        <div style={S.infoGrid}>
+          <InfoRow label="Client Name"    value={layout.clientName   || "—"} />
+          <InfoRow label="Client #"       value={layout.clientNum    || "—"} />
+          <InfoRow label="Location"       value={layout.locationName || "—"} />
+          <InfoRow label="System Height"  value={`${layout.systemHeightIn}"`} />
+          <InfoRow label="Ceiling Height" value={`${layout.ceilingHeightIn}"`} />
+          <InfoRow label="Overall Depth"  value={`${layout.closetDepthIn}"`} />
         </div>
 
-        {/* ── Design Summary ──────────────────────────────────────────────── */}
-        <div style={styles.designSummary}>
-          <span style={styles.summaryLabel}>Design</span>
-          <span style={{ fontSize: "13px", color: "#555" }}>
-            {sections.length} section{sections.length !== 1 ? "s" : ""} &nbsp;·&nbsp;
-            {panelCount} panels &nbsp;·&nbsp; {sectionSummary}
-          </span>
-        </div>
-
-        {/* ── Line Items Table ─────────────────────────────────────────────── */}
-        <table style={styles.table}>
-          <thead>
-            <tr style={styles.tableHeadRow}>
-              <th style={{ ...styles.th, textAlign: "left" }}>Item</th>
-              <th style={{ ...styles.th, textAlign: "right" }}>Qty</th>
-              <th style={{ ...styles.th, textAlign: "right" }}>Unit Price</th>
-              <th style={{ ...styles.th, textAlign: "right" }}>Total</th>
-            </tr>
-          </thead>
-          <tbody>
-            {lineItems.length === 0 ? (
-              <tr>
-                <td colSpan={4} style={{ padding: "20px", textAlign: "center", color: "#999", fontSize: "13px" }}>
-                  No items — add sections and components in the design.
-                </td>
-              </tr>
-            ) : (
-              lineItems.map((li, i) => (
-                <tr key={i} style={i % 2 === 0 ? styles.rowEven : styles.rowOdd}>
-                  <td style={styles.td}>{li.label}</td>
-                  <td style={{ ...styles.td, textAlign: "right" }}>{li.qty}</td>
-                  <td style={{ ...styles.td, textAlign: "right" }}>{fmt(li.unitPrice)}</td>
-                  <td style={{ ...styles.td, textAlign: "right", fontWeight: "600" }}>{fmt(li.total)}</td>
-                </tr>
-              ))
-            )}
-
-            {/* Bridge Shelf — not yet in pricing engine */}
-            <tr style={styles.rowPlaceholder}>
-              <td style={styles.td}>Bridge Shelf</td>
-              <td style={{ ...styles.td, textAlign: "right", color: "#aaa" }}>—</td>
-              <td style={{ ...styles.td, textAlign: "right", color: "#aaa" }}>—</td>
-              <td style={{ ...styles.td, textAlign: "right", color: "#aaa", fontStyle: "italic", fontSize: "11px" }}>not yet priced</td>
-            </tr>
-
-            {/* Doors — not yet in pricing engine */}
-            <tr style={styles.rowPlaceholder}>
-              <td style={styles.td}>Doors</td>
-              <td style={{ ...styles.td, textAlign: "right", color: "#aaa" }}>—</td>
-              <td style={{ ...styles.td, textAlign: "right", color: "#aaa" }}>—</td>
-              <td style={{ ...styles.td, textAlign: "right", color: "#aaa", fontStyle: "italic", fontSize: "11px" }}>not yet priced</td>
-            </tr>
-          </tbody>
-        </table>
-
-        {/* ── Totals ──────────────────────────────────────────────────────── */}
-        <div style={styles.totalsBlock}>
-          <TotalRow label="Subtotal" value={fmtDec(subtotal)} />
-          <TotalRow label={`Adjustment (${Math.round(ADJUSTMENT_RATE * 100)}%)`} value={fmtDec(adjustment)} />
-          <div style={styles.totalFinalDivider} />
-          <TotalRow label="Worksheet Total" value={fmtDec(total)} bold />
-        </div>
-
-        {/* ── Warnings ────────────────────────────────────────────────────── */}
-        {warnings.length > 0 && (
-          <div style={{ marginTop: "24px", display: "flex", flexDirection: "column", gap: "8px" }}>
-            <p style={{ fontSize: "12px", fontWeight: "700", color: "#92400e", margin: 0, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-              Notes
-            </p>
-            {warnings.map((w, i) => (
-              <div key={i} style={styles.warning}>⚠ {w}</div>
-            ))}
+        {/* ── Project summary strip ────────────────────────────────────────── */}
+        {results.length > 0 && (
+          <div style={S.summaryStrip}>
+            <SummaryBadge label="Walls"    value={results.length} />
+            <SummaryBadge label="Panels"   value={combinedPanels} />
+            <SummaryBadge label="Shelves"  value={combinedShelves} />
+            <SummaryBadge label="Rods"     value={combinedRods} />
+            <SummaryBadge label="Drawers"  value={combinedDrawers} />
           </div>
         )}
 
-        {/* ── Bottom Nav ──────────────────────────────────────────────────── */}
+        {/* ── Empty state ──────────────────────────────────────────────────── */}
+        {results.length === 0 && (
+          <div style={{ padding: "40px 0", textAlign: "center", color: "#999" }}>
+            <p style={{ fontSize: "15px", marginBottom: "8px" }}>No walls have been designed yet.</p>
+            <p style={{ fontSize: "13px" }}>Add sections to walls in the Design editor, then come back here.</p>
+          </div>
+        )}
+
+        {/* ── Per-wall sections ────────────────────────────────────────────── */}
+        {results.map((res, wi) => (
+          <div key={res.wallId} style={{ marginTop: wi === 0 ? "32px" : "40px" }}>
+
+            {/* Wall heading */}
+            <div style={S.wallHeading}>
+              <span style={S.wallLabel}>{res.label}</span>
+              <span style={S.wallMeta}>
+                {res.wallWidthIn}" wide · {res.pricing.lineItems.length} line item{res.pricing.lineItems.length !== 1 ? "s" : ""}
+                {" · "}{res.panelCount} panel{res.panelCount !== 1 ? "s" : ""}
+                {" · "}{res.shelfCount} shelf{res.shelfCount !== 1 ? "ves" : ""}
+                {res.rodCount > 0 ? ` · ${res.rodCount} rod${res.rodCount !== 1 ? "s" : ""}` : ""}
+                {res.drawerCount > 0 ? ` · ${res.drawerCount} drawer${res.drawerCount !== 1 ? "s" : ""}` : ""}
+              </span>
+            </div>
+
+            {/* Line items table */}
+            <table style={S.table}>
+              <thead>
+                <tr style={S.tableHeadRow}>
+                  <th style={{ ...S.th, textAlign: "left" }}>Item</th>
+                  <th style={{ ...S.th, textAlign: "right" }}>Qty</th>
+                  <th style={{ ...S.th, textAlign: "right" }}>Unit Price</th>
+                  <th style={{ ...S.th, textAlign: "right" }}>Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                {res.pricing.lineItems.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} style={{ padding: "20px", textAlign: "center", color: "#999", fontSize: "13px" }}>
+                      No priced items for this wall.
+                    </td>
+                  </tr>
+                ) : (
+                  res.pricing.lineItems.map((li, i) => (
+                    <tr key={i} style={i % 2 === 0 ? S.rowEven : S.rowOdd}>
+                      <td style={S.td}>{li.label}</td>
+                      <td style={{ ...S.td, textAlign: "right" }}>{li.qty}</td>
+                      <td style={{ ...S.td, textAlign: "right" }}>{fmt(li.unitPrice)}</td>
+                      <td style={{ ...S.td, textAlign: "right", fontWeight: "600" }}>{fmt(li.total)}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+
+            {/* Wall totals */}
+            {res.pricing.lineItems.length > 0 && (
+              <div style={S.wallTotals}>
+                <WallTotalRow label="Subtotal"                                         value={fmtDec(res.pricing.subtotal)} />
+                <WallTotalRow label={`Adjustment (${Math.round(ADJUSTMENT_RATE * 100)}%)`} value={fmtDec(res.pricing.adjustment)} />
+                <div style={{ borderTop: "1.5px solid #1a1a1a", margin: "4px 0" }} />
+                <WallTotalRow label={`${res.label} Total`} value={fmtDec(res.pricing.total)} bold />
+              </div>
+            )}
+
+            {/* Per-wall warnings */}
+            {res.pricing.warnings.length > 0 && (
+              <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "5px" }}>
+                {res.pricing.warnings.map((w, i) => (
+                  <div key={i} style={S.warning}>⚠ {w}</div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+
+        {/* ── Divider before combined totals ───────────────────────────────── */}
+        {results.length > 1 && (
+          <div style={{ borderTop: "2px solid #1a1a1a", margin: "40px 0 28px" }} />
+        )}
+
+        {/* ── Combined totals (shown when 2+ walls) ────────────────────────── */}
+        {results.length > 1 && (
+          <>
+            <p style={{ fontSize: "13px", fontWeight: "700", color: "#555", textTransform: "uppercase",
+              letterSpacing: "0.6px", margin: "0 0 14px" }}>
+              Full Closet Combined
+            </p>
+            <div style={S.combinedTotals}>
+              <CombinedRow label="Combined Subtotal"                                       value={fmtDec(combinedSubtotal)} />
+              <CombinedRow label={`Adjustment (${Math.round(ADJUSTMENT_RATE * 100)}%)`}   value={fmtDec(combinedAdjustment)} />
+              <div style={{ borderTop: "2px solid #1a1a1a", margin: "6px 0" }} />
+              <CombinedRow label="Worksheet Total" value={fmtDec(combinedTotal)} bold />
+            </div>
+          </>
+        )}
+
+        {/* Single-wall — just show the total block at the bottom */}
+        {results.length === 1 && (
+          <div style={{ marginTop: "0", borderTop: "2px solid #e0dbd4", paddingTop: "20px" }}>
+            <div style={S.combinedTotals}>
+              <CombinedRow label="Subtotal"                                                value={fmtDec(results[0].pricing.subtotal)} />
+              <CombinedRow label={`Adjustment (${Math.round(ADJUSTMENT_RATE * 100)}%)`}   value={fmtDec(results[0].pricing.adjustment)} />
+              <div style={{ borderTop: "2px solid #1a1a1a", margin: "6px 0" }} />
+              <CombinedRow label="Worksheet Total" value={fmtDec(results[0].pricing.total)} bold />
+            </div>
+          </div>
+        )}
+
+        {/* ── Placeholder rows (not yet in pricing engine) ─────────────────── */}
+        <div style={{ marginTop: "24px" }}>
+          <p style={{ fontSize: "10px", fontWeight: "700", color: "#aaa", textTransform: "uppercase",
+            letterSpacing: "0.5px", margin: "0 0 8px" }}>
+            Not yet priced
+          </p>
+          <table style={{ ...S.table, opacity: 0.5 }}>
+            <tbody>
+              <tr style={S.rowEven}>
+                <td style={S.td}>Bridge Shelf</td>
+                <td style={{ ...S.td, textAlign: "right", color: "#aaa" }}>—</td>
+                <td style={{ ...S.td, textAlign: "right", color: "#aaa" }}>—</td>
+                <td style={{ ...S.td, textAlign: "right", color: "#aaa", fontStyle: "italic", fontSize: "11px" }}>TBD</td>
+              </tr>
+              <tr style={S.rowOdd}>
+                <td style={S.td}>Doors</td>
+                <td style={{ ...S.td, textAlign: "right", color: "#aaa" }}>—</td>
+                <td style={{ ...S.td, textAlign: "right", color: "#aaa" }}>—</td>
+                <td style={{ ...S.td, textAlign: "right", color: "#aaa", fontStyle: "italic", fontSize: "11px" }}>TBD</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        {/* ── Bottom nav ───────────────────────────────────────────────────── */}
         <div style={{ marginTop: "40px", display: "flex", justifyContent: "space-between" }}>
-          <button onClick={() => router.push("/elevation")} style={styles.btnBack}>
+          <button onClick={() => router.push("/design")} style={S.btnBack}>
             ← Back to Design
           </button>
-          <button onClick={() => router.push("/presentation")} style={styles.btnNext}>
-            Continue to Price Presentation →
+          <button onClick={() => router.push("/design-preview")} style={S.btnNext}>
+            Design Preview →
           </button>
         </div>
 
@@ -213,24 +305,56 @@ export default function WorksheetPage() {
   );
 }
 
-// ─── Small presentational helpers ─────────────────────────────────────────────
+// ─── Small helpers ─────────────────────────────────────────────────────────────
 
 function InfoRow({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
-      <span style={{ fontSize: "10px", fontWeight: "700", color: "#999", textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</span>
+      <span style={{ fontSize: "10px", fontWeight: "700", color: "#999",
+        textTransform: "uppercase", letterSpacing: "0.5px" }}>
+        {label}
+      </span>
       <span style={{ fontSize: "14px", color: "#111", fontWeight: "500" }}>{value}</span>
     </div>
   );
 }
 
-function TotalRow({ label, value, bold }: { label: string; value: string; bold?: boolean }) {
+function SummaryBadge({ label, value }: { label: string; value: number }) {
   return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-      <span style={{ fontSize: bold ? "15px" : "13px", fontWeight: bold ? "700" : "400", color: bold ? "#111" : "#555" }}>
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: "2px" }}>
+      <span style={{ fontSize: "18px", fontWeight: "800", color: "#1a1a1a" }}>{value}</span>
+      <span style={{ fontSize: "10px", color: "#888", textTransform: "uppercase",
+        letterSpacing: "0.4px" }}>
         {label}
       </span>
-      <span style={{ fontSize: bold ? "18px" : "14px", fontWeight: bold ? "700" : "500", color: bold ? "#111" : "#333", minWidth: "120px", textAlign: "right" }}>
+    </div>
+  );
+}
+
+function WallTotalRow({ label, value, bold }: { label: string; value: string; bold?: boolean }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span style={{ fontSize: bold ? "14px" : "13px", fontWeight: bold ? "700" : "400",
+        color: bold ? "#111" : "#555" }}>
+        {label}
+      </span>
+      <span style={{ fontSize: bold ? "15px" : "13px", fontWeight: bold ? "700" : "500",
+        color: bold ? "#111" : "#333", minWidth: "120px", textAlign: "right" }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function CombinedRow({ label, value, bold }: { label: string; value: string; bold?: boolean }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span style={{ fontSize: bold ? "15px" : "13px", fontWeight: bold ? "700" : "400",
+        color: bold ? "#1a1a1a" : "#555" }}>
+        {label}
+      </span>
+      <span style={{ fontSize: bold ? "18px" : "14px", fontWeight: bold ? "800" : "500",
+        color: bold ? "#1a1a1a" : "#333", minWidth: "130px", textAlign: "right" }}>
         {value}
       </span>
     </div>
@@ -239,142 +363,152 @@ function TotalRow({ label, value, bold }: { label: string; value: string; bold?:
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
 
-const styles: Record<string, React.CSSProperties> = {
+const S: Record<string, React.CSSProperties> = {
   page: {
-    fontFamily: "sans-serif",
-    minHeight: "100vh",
+    fontFamily:      "sans-serif",
+    minHeight:       "100vh",
     backgroundColor: "#f5f2ee",
-    padding: "40px 24px",
+    padding:         "40px 24px",
   },
   sheet: {
-    maxWidth: "760px",
-    margin: "0 auto",
+    maxWidth:        "800px",
+    margin:          "0 auto",
     backgroundColor: "#fff",
-    border: "1px solid #e0dbd4",
-    borderRadius: "12px",
-    padding: "40px 48px",
+    border:          "1px solid #e0dbd4",
+    borderRadius:    "12px",
+    padding:         "40px 48px",
   },
   header: {
-    display: "flex",
+    display:        "flex",
     justifyContent: "space-between",
-    alignItems: "flex-start",
-    marginBottom: "32px",
-    flexWrap: "wrap",
-    gap: "16px",
+    alignItems:     "flex-start",
+    marginBottom:   "28px",
+    flexWrap:       "wrap",
+    gap:            "16px",
   },
   h1: {
-    fontSize: "24px",
-    fontWeight: "800",
-    color: "#1a1a1a",
-    margin: 0,
+    fontSize:     "24px",
+    fontWeight:   "800",
+    color:        "#1a1a1a",
+    margin:       0,
     marginBottom: "4px",
   },
   subtitle: {
-    fontSize: "12px",
-    color: "#999",
-    margin: 0,
-    textTransform: "uppercase",
-    letterSpacing: "0.5px",
+    fontSize:        "12px",
+    color:           "#999",
+    margin:          0,
+    textTransform:   "uppercase",
+    letterSpacing:   "0.5px",
   },
   btnBack: {
-    padding: "9px 18px",
-    fontSize: "13px",
-    fontWeight: "600",
+    padding:         "9px 18px",
+    fontSize:        "13px",
+    fontWeight:      "600",
     backgroundColor: "#fff",
-    color: "#444",
-    border: "1px solid #ccc",
-    borderRadius: "7px",
-    cursor: "pointer",
+    color:           "#444",
+    border:          "1px solid #ccc",
+    borderRadius:    "7px",
+    cursor:          "pointer",
   },
   btnNext: {
-    padding: "9px 18px",
-    fontSize: "13px",
-    fontWeight: "700",
+    padding:         "9px 18px",
+    fontSize:        "13px",
+    fontWeight:      "700",
     backgroundColor: "#1a1a1a",
-    color: "#fff",
-    border: "none",
-    borderRadius: "7px",
-    cursor: "pointer",
+    color:           "#fff",
+    border:          "none",
+    borderRadius:    "7px",
+    cursor:          "pointer",
   },
   infoGrid: {
-    display: "grid",
-    gridTemplateColumns: "repeat(3, 1fr)",
-    gap: "20px 32px",
-    padding: "20px 24px",
+    display:              "grid",
+    gridTemplateColumns:  "repeat(3, 1fr)",
+    gap:                  "20px 32px",
+    padding:              "20px 24px",
+    backgroundColor:      "#f9f7f4",
+    border:               "1px solid #e8e4de",
+    borderRadius:         "8px",
+    marginBottom:         "20px",
+  },
+  summaryStrip: {
+    display:         "flex",
+    justifyContent:  "space-around",
+    padding:         "14px 0",
     backgroundColor: "#f9f7f4",
-    border: "1px solid #e8e4de",
-    borderRadius: "8px",
-    marginBottom: "24px",
+    border:          "1px solid #e8e4de",
+    borderRadius:    "8px",
+    marginBottom:    "4px",
   },
-  designSummary: {
-    display: "flex",
-    alignItems: "center",
-    gap: "12px",
-    marginBottom: "20px",
+  wallHeading: {
+    display:        "flex",
+    alignItems:     "baseline",
+    gap:            "12px",
+    marginBottom:   "10px",
+    paddingBottom:  "8px",
+    borderBottom:   "2px solid #1a1a1a",
   },
-  summaryLabel: {
-    fontSize: "10px",
-    fontWeight: "700",
-    color: "#999",
-    textTransform: "uppercase",
-    letterSpacing: "0.5px",
+  wallLabel: {
+    fontSize:   "16px",
+    fontWeight: "800",
+    color:      "#1a1a1a",
+  },
+  wallMeta: {
+    fontSize: "12px",
+    color:    "#888",
   },
   table: {
-    width: "100%",
-    borderCollapse: "collapse",
-    fontSize: "13px",
-    marginBottom: "0",
+    width:           "100%",
+    borderCollapse:  "collapse",
+    fontSize:        "13px",
+    marginBottom:    "0",
   },
   tableHeadRow: {
     borderBottom: "2px solid #1a1a1a",
   },
   th: {
-    padding: "8px 12px",
-    fontSize: "11px",
-    fontWeight: "700",
-    color: "#555",
-    textTransform: "uppercase",
-    letterSpacing: "0.5px",
+    padding:         "8px 12px",
+    fontSize:        "11px",
+    fontWeight:      "700",
+    color:           "#555",
+    textTransform:   "uppercase",
+    letterSpacing:   "0.5px",
   },
   td: {
-    padding: "10px 12px",
-    color: "#222",
+    padding:  "10px 12px",
+    color:    "#222",
     fontSize: "13px",
   },
   rowEven: {
     backgroundColor: "#fff",
-    borderBottom: "1px solid #f0ece6",
+    borderBottom:    "1px solid #f0ece6",
   },
   rowOdd: {
     backgroundColor: "#faf8f5",
-    borderBottom: "1px solid #f0ece6",
+    borderBottom:    "1px solid #f0ece6",
   },
-  rowPlaceholder: {
-    backgroundColor: "#fafafa",
-    borderBottom: "1px solid #f0ece6",
-    opacity: 0.6,
-  },
-  totalsBlock: {
-    marginTop: "0",
-    borderTop: "2px solid #e0dbd4",
-    paddingTop: "16px",
-    display: "flex",
+  wallTotals: {
+    marginTop:     "0",
+    borderTop:     "1px solid #e0dbd4",
+    paddingTop:    "12px",
+    display:       "flex",
     flexDirection: "column",
-    gap: "10px",
-    maxWidth: "360px",
-    marginLeft: "auto",
+    gap:           "7px",
+    maxWidth:      "340px",
+    marginLeft:    "auto",
   },
-  totalFinalDivider: {
-    borderTop: "2px solid #1a1a1a",
-    marginTop: "4px",
-    marginBottom: "4px",
+  combinedTotals: {
+    display:       "flex",
+    flexDirection: "column",
+    gap:           "10px",
+    maxWidth:      "380px",
+    marginLeft:    "auto",
   },
   warning: {
-    fontSize: "12px",
-    color: "#92400e",
+    fontSize:        "12px",
+    color:           "#92400e",
     backgroundColor: "#fffbeb",
-    border: "1px solid #fcd34d",
-    borderRadius: "5px",
-    padding: "8px 12px",
+    border:          "1px solid #fcd34d",
+    borderRadius:    "5px",
+    padding:         "8px 12px",
   },
 };

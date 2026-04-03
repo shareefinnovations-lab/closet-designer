@@ -9,7 +9,6 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import type { Config } from "@/app/elevation/_lib/types";
-import { generateSuggestion } from "@/app/elevation/_lib/suggestions";
 
 const STORAGE_KEY = "closet-setup";
 
@@ -25,24 +24,38 @@ export default function SetupPage() {
   const [leftReturnIn,    setLeftReturnIn]    = useState(0.5);
   const [rightReturnIn,   setRightReturnIn]   = useState(2.5);
   const [remarks,         setRemarks]         = useState("");
-  const [suggestion,      setSuggestion]      = useState<string[] | null>(null);
+  const [projectType,     setProjectType]     = useState("");
 
-  // Pre-fill from existing saved setup if the user came back to edit
+  // Pre-fill from saved setup (returning to edit) or from dashboard session
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    try {
-      const saved = JSON.parse(raw) as Config;
-      setClientName(saved.clientName       ?? "");
-      setClientNum(saved.clientNum         ?? "");
-      setLocationName(saved.locationName   ?? "");
-      setWallWidthIn(saved.wallWidthIn     ?? 66);
-      setCeilingHeightIn(saved.ceilingHeightIn ?? 101);
-      setClosetDepthIn(saved.closetDepthIn ?? 25);
-      setLeftReturnIn(saved.leftReturnIn   ?? 0.5);
-      setRightReturnIn(saved.rightReturnIn ?? 2.5);
-      setRemarks(saved.remarks             ?? "");
-    } catch { /* ignore corrupt data */ }
+    // 1. Try restoring a previous full setup
+    const rawSetup = localStorage.getItem(STORAGE_KEY);
+    if (rawSetup) {
+      try {
+        const saved = JSON.parse(rawSetup) as Config;
+        setClientName(saved.clientName           ?? "");
+        setClientNum(saved.clientNum             ?? "");
+        setLocationName(saved.locationName       ?? "");
+        setWallWidthIn(saved.wallWidthIn         ?? 66);
+        setCeilingHeightIn(saved.ceilingHeightIn ?? 101);
+        setClosetDepthIn(saved.closetDepthIn     ?? 25);
+        setLeftReturnIn(saved.leftReturnIn       ?? 0.5);
+        setRightReturnIn(saved.rightReturnIn     ?? 2.5);
+        setRemarks(saved.remarks                 ?? "");
+        setProjectType(saved.projectType         ?? "");
+        return;
+      } catch { /* ignore corrupt data */ }
+    }
+
+    // 2. No full setup yet — check if dashboard wrote a session (clientNum + projectType)
+    const rawSession = localStorage.getItem("closet-session");
+    if (rawSession) {
+      try {
+        const session = JSON.parse(rawSession) as { clientNum?: string; projectType?: string };
+        if (session.clientNum)   setClientNum(session.clientNum);
+        if (session.projectType) setProjectType(session.projectType);
+      } catch { /* ignore */ }
+    }
   }, []);
 
   const canStart = wallWidthIn > 0 && ceilingHeightIn > 0 && closetDepthIn > 0;
@@ -54,27 +67,18 @@ export default function SetupPage() {
       clientName, clientNum, locationName,
       wallWidthIn, ceilingHeightIn, closetDepthIn,
       leftReturnIn, rightReturnIn, remarks,
+      projectType: projectType || undefined,
     };
+    // Clear the temporary dashboard session now that the full config is saved
+    localStorage.removeItem("closet-session");
 
-    // Save setup
+    // Save setup — Room Layout Builder reads from this key
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+    // Clear any stale design state so the new flow starts fresh
+    localStorage.removeItem("room-layout");
+    localStorage.removeItem("design-state");
 
-    // Generate and save starter layout
-    const { sections, panelHeights, appliedRules } = generateSuggestion(config);
-    localStorage.setItem("closet-design", JSON.stringify({
-      config,
-      sections,
-      panelHeights,
-      ceilingH: ceilingHeightIn,
-    }));
-
-    // Show suggestion preview briefly, then navigate
-    if (appliedRules.length > 0) {
-      setSuggestion(appliedRules);
-      setTimeout(() => router.push("/elevation"), 1400);
-    } else {
-      router.push("/elevation");
-    }
+    router.push("/room-layout");
   }
 
   // ── Styles ──────────────────────────────────────────────────────────────────
@@ -102,11 +106,26 @@ export default function SetupPage() {
       <style>{`.setup-input::placeholder { color: #999; }`}</style>
       <div style={{ width: "100%", maxWidth: "540px" }}>
 
-        <h1 style={{ fontSize: "26px", fontWeight: "800", color: "#1a1a1a", marginBottom: "4px" }}>
-          Closet Designer
-        </h1>
-        <p style={{ fontSize: "14px", color: "#888", marginTop: "0", marginBottom: "32px" }}>
-          Reach-in closet configurator
+        {/* Back link */}
+        <button onClick={() => router.push("/")} style={{
+          fontSize: "12px", fontWeight: "600", color: "#888", background: "none",
+          border: "none", cursor: "pointer", padding: "0 0 20px", display: "flex", alignItems: "center", gap: "4px",
+        }}>
+          ← Dashboard
+        </button>
+
+        <div style={{ display: "flex", alignItems: "baseline", gap: "10px", marginBottom: "4px" }}>
+          <h1 style={{ fontSize: "26px", fontWeight: "800", color: "#1a1a1a", margin: 0 }}>
+            Project Setup
+          </h1>
+          {projectType && (
+            <span style={{ fontSize: "13px", fontWeight: "600", color: "#fff", backgroundColor: "#1a1a1a", borderRadius: "5px", padding: "2px 9px" }}>
+              {projectType}
+            </span>
+          )}
+        </div>
+        <p style={{ fontSize: "14px", color: "#888", marginTop: "4px", marginBottom: "32px" }}>
+          Enter client details and closet dimensions to generate a starter layout.
         </p>
 
         {/* ── Client Info ─────────────────────────────────────────────────── */}
@@ -189,37 +208,24 @@ export default function SetupPage() {
               }}
             />
             <span style={{ fontSize: "11px", color: "#aaa", marginTop: "4px" }}>
-              A starter layout will be suggested based on what you describe.
+              Notes about the client's needs — used to set up the room layout.
             </span>
           </div>
         </div>
 
-        {/* ── Suggestion preview ──────────────────────────────────────────── */}
-        {suggestion && (
-          <div style={{ backgroundColor: "#f0f7f0", border: "1px solid #c8e0c8", borderRadius: "8px", padding: "14px 18px", marginBottom: "20px" }}>
-            <p style={{ fontSize: "12px", fontWeight: "700", color: "#2a7a4f", margin: "0 0 8px", textTransform: "uppercase", letterSpacing: "0.5px" }}>
-              Starter layout generated
-            </p>
-            {suggestion.map((rule, i) => (
-              <p key={i} style={{ fontSize: "13px", color: "#2a7a4f", margin: "3px 0" }}>✓ {rule}</p>
-            ))}
-            <p style={{ fontSize: "12px", color: "#aaa", marginTop: "8px", marginBottom: 0 }}>Opening designer…</p>
-          </div>
-        )}
-
         {/* ── Submit ──────────────────────────────────────────────────────── */}
         <button
           onClick={handleStart}
-          disabled={!canStart || !!suggestion}
+          disabled={!canStart}
           style={{
             width: "100%", padding: "14px", fontSize: "15px", fontWeight: "700",
-            backgroundColor: canStart && !suggestion ? "#1a1a1a" : "#c5c0b8",
+            backgroundColor: canStart ? "#1a1a1a" : "#c5c0b8",
             color: "#fff", border: "none", borderRadius: "8px",
-            cursor: canStart && !suggestion ? "pointer" : "default",
+            cursor: canStart ? "pointer" : "default",
             letterSpacing: "0.3px",
           }}
         >
-          {suggestion ? "Opening Designer…" : "Start Designing →"}
+          Continue to Room Layout →
         </button>
         <p style={{ fontSize: "12px", color: "#bbb", textAlign: "center", marginTop: "12px" }}>
           * Required fields

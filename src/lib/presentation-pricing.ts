@@ -1,142 +1,115 @@
 // src/lib/presentation-pricing.ts
 //
-// Presentation pricing engine — extends the base pricing engine with:
-//   - Material tier multipliers  (Everyday / Classic / Regency / Brio)
-//   - Custom options             (backing, doors, molding, slides, etc.)
-//   - Accessories                (valet rods, tie racks, etc.)
-//   - Promotion discount
+// Presentation pricing engine — Designing Lite + dual-discount rules.
+//
+// Calculation chain:
+//   1. Compute each line-item's original price
+//   2. discountedPrice = originalPrice × (1 − LINE_DISCOUNT_RATE)   [40% off]
+//   3. subtotalAfter40 = Σ discountedPrices
+//   4. discountAmount15 = subtotalAfter40 × FINAL_DISCOUNT_RATE      [15% off]
+//   5. finalTotal = subtotalAfter40 × (1 − FINAL_DISCOUNT_RATE)
+//
 // Pure function — no React, no side-effects.
 
 import { computePricing, type PricingSection, type LineItem } from "./pricing";
 
-// ─── Material Tiers ───────────────────────────────────────────────────────────
+// ─── Discount constants ───────────────────────────────────────────────────────
+
+export const LINE_DISCOUNT_RATE  = 0.40; // 40% off every individual line item
+export const FINAL_DISCOUNT_RATE = 0.15; // additional 15% off the 40%-discounted subtotal
+
+// ─── System Tiers ─────────────────────────────────────────────────────────────
 
 export type MaterialTier = "Everyday" | "Classic" | "Regency" | "Brio";
 
 export interface TierDef {
-  label:      string;
-  tagline:    string;
-  multiplier: number; // applied to base total (post-11% adjustment)
+  label:       string;
+  tagline:     string;
+  ratePercent: number;
 }
 
 export const TIER_ORDER: MaterialTier[] = ["Everyday", "Classic", "Regency", "Brio"];
 
 export const MATERIAL_TIERS: Record<MaterialTier, TierDef> = {
-  Everyday: { label: "Everyday", tagline: "Great value starter system",         multiplier: 1.00 },
-  Classic:  { label: "Classic",  tagline: "Most popular — upgraded finishes",   multiplier: 1.15 },
-  Regency:  { label: "Regency",  tagline: "Premium materials & aesthetics",     multiplier: 1.30 },
-  Brio:     { label: "Brio",     tagline: "Top-of-the-line full feature system", multiplier: 1.45 },
+  Everyday: { label: "Everyday", tagline: "Standard system",                    ratePercent: 0  },
+  Classic:  { label: "Classic",  tagline: "Most popular — upgraded finishes",   ratePercent: 8  },
+  Regency:  { label: "Regency",  tagline: "Premium materials & aesthetics",     ratePercent: 15 },
+  Brio:     { label: "Brio",     tagline: "Top-of-the-line full feature system", ratePercent: 36 },
 };
 
-// ─── Layout counts (derived from sections) ────────────────────────────────────
+// ─── Material Options ─────────────────────────────────────────────────────────
 
-export interface LayoutCounts {
-  panelCount:   number;
-  sectionCount: number;
-  shelfCount:   number;  // includes 2 lock shelves per section
-  drawerCount:  number;  // individual drawer boxes
-  rodCount:     number;
-  wallWidthIn:  number;
+export type MaterialOption = "none" | "solidColor" | "woodgrain";
+
+export interface MaterialOptionDef {
+  label:       string;
+  ratePercent: number;
 }
 
-export function computeLayoutCounts(
-  sections: PricingSection[],
-  wallWidthIn: number,
-): LayoutCounts {
-  let shelfCount = 0, drawerCount = 0, rodCount = 0;
-  for (const sec of sections) {
-    shelfCount += 2; // lock shelves (top + bottom of every section)
-    for (const comp of sec.components) {
-      if (comp.type === "Shelf")       shelfCount++;
-      if (comp.type === "Rod")         rodCount++;
-      if (comp.type === "DrawerStack") drawerCount += comp.drawerHeights.length;
-    }
-  }
-  return {
-    panelCount:   sections.length + 1,
-    sectionCount: sections.length,
-    shelfCount,
-    drawerCount,
-    rodCount,
-    wallWidthIn,
-  };
+export const MATERIAL_OPTION_ORDER: MaterialOption[] = ["none", "solidColor", "woodgrain"];
+
+export const MATERIAL_OPTIONS: Record<MaterialOption, MaterialOptionDef> = {
+  none:       { label: "Standard (White)",     ratePercent: 0  },
+  solidColor: { label: "Solid Color Melamine", ratePercent: 8  },
+  woodgrain:  { label: "Woodgrain Melamine",   ratePercent: 25 },
+};
+
+// ─── Backing Options ──────────────────────────────────────────────────────────
+
+export type BackingOption =
+  | "none"
+  | "standard_quarter"
+  | "standard_threequarter"
+  | "brio_quarter"
+  | "brio_threequarter";
+
+export interface BackingOptionDef {
+  label:       string;
+  spec:        string;
+  ratePerSqFt: number;
 }
 
-// ─── Custom Options ───────────────────────────────────────────────────────────
-
-export type OptionKey =
-  | "solidColorMelamine"
-  | "woodgrainMelamine"
-  | "backing"
-  | "brioBacking"
-  | "decoDoors100_400"
-  | "decoDoors500_Shaker"
-  | "moldingPackage"
-  | "moldingTopOrBottom"
-  | "softCloseSlides"
-  | "accentTopShelf"
-  | "premiumOptions";
-
-export const OPTION_ORDER: OptionKey[] = [
-  "solidColorMelamine",
-  "woodgrainMelamine",
-  "backing",
-  "brioBacking",
-  "decoDoors100_400",
-  "decoDoors500_Shaker",
-  "moldingPackage",
-  "moldingTopOrBottom",
-  "softCloseSlides",
-  "accentTopShelf",
-  "premiumOptions",
+export const BACKING_OPTION_ORDER: BackingOption[] = [
+  "none", "standard_quarter", "standard_threequarter", "brio_quarter", "brio_threequarter",
 ];
 
-export interface OptionDef {
-  label:     string;
-  unitLabel: string;
-  unitPrice: number; // 0 = standard/included
-  calcQty:   (c: LayoutCounts) => number;
+export const BACKING_OPTIONS: Record<BackingOption, BackingOptionDef> = {
+  none:                  { label: "No Backing",       spec: "",             ratePerSqFt: 0     },
+  standard_quarter:      { label: "Standard Backing", spec: "1/4\" 1-sided", ratePerSqFt: 17.80 },
+  standard_threequarter: { label: "Standard Backing", spec: "3/4\" 2-sided", ratePerSqFt: 29.00 },
+  brio_quarter:          { label: "Brio Backing",     spec: "1/4\" 1-sided", ratePerSqFt: 21.80 },
+  brio_threequarter:     { label: "Brio Backing",     spec: "3/4\" 2-sided", ratePerSqFt: 34.00 },
+};
+
+// ─── Deco Options ─────────────────────────────────────────────────────────────
+
+export type DecoOption = "none" | "deco100_400_700" | "deco500_600";
+
+export interface DecoOptionDef {
+  label:         string;
+  spec:          string;
+  pricePerPiece: number;
 }
 
-export const OPTIONS: Record<OptionKey, OptionDef> = {
-  solidColorMelamine:  { label: "Solid Color Melamine",          unitLabel: "per panel",    unitPrice: 0,   calcQty: c => c.panelCount   },
-  woodgrainMelamine:   { label: "Woodgrain Melamine",            unitLabel: "per panel",    unitPrice: 28,  calcQty: c => c.panelCount   },
-  backing:             { label: "Backing",                        unitLabel: "per section",  unitPrice: 52,  calcQty: c => c.sectionCount },
-  brioBacking:         { label: "Brio Backing",                   unitLabel: "per section",  unitPrice: 78,  calcQty: c => c.sectionCount },
-  decoDoors100_400:    { label: "Deco Doors (100–400 Series)",    unitLabel: "per opening",  unitPrice: 195, calcQty: c => c.sectionCount },
-  decoDoors500_Shaker: { label: "Deco Doors (500 / Shaker 600)", unitLabel: "per opening",  unitPrice: 295, calcQty: c => c.sectionCount },
-  moldingPackage:      { label: "Molding Package",                unitLabel: "per lin. in.", unitPrice: 4,   calcQty: c => c.wallWidthIn  },
-  moldingTopOrBottom:  { label: "Molding Top or Bottom",          unitLabel: "per lin. in.", unitPrice: 2,   calcQty: c => c.wallWidthIn  },
-  softCloseSlides:     { label: "Soft Close Slides",              unitLabel: "per drawer",   unitPrice: 38,  calcQty: c => c.drawerCount  },
-  accentTopShelf:      { label: "Accent Top Shelf",               unitLabel: "per panel",    unitPrice: 58,  calcQty: c => c.panelCount   },
-  premiumOptions:      { label: "Premium Options",                unitLabel: "package",      unitPrice: 175, calcQty: _ => 1              },
+export const DECO_OPTION_ORDER: DecoOption[] = ["none", "deco100_400_700", "deco500_600"];
+
+export const DECO_OPTIONS: Record<DecoOption, DecoOptionDef> = {
+  none:            { label: "No Deco",               spec: "",                            pricePerPiece: 0   },
+  deco100_400_700: { label: "Deco 100–400 / 700",    spec: "100–400 series & 700 series", pricePerPiece: 170 },
+  deco500_600:     { label: "Deco 500 / Shaker 600", spec: "500 series & Shaker 600",     pricePerPiece: 306 },
 };
 
 // ─── Accessories ──────────────────────────────────────────────────────────────
 
 export type AccessoryKey =
-  | "drawerInserts"
-  | "valetRods"
-  | "tieRacks"
-  | "beltRacks"
-  | "hamper"
-  | "jewelryInserts"
-  | "hooks";
+  | "drawerInserts" | "valetRods" | "tieRacks" | "beltRacks"
+  | "hamper" | "jewelryInserts" | "hooks";
 
 export const ACCESSORY_ORDER: AccessoryKey[] = [
-  "drawerInserts",
-  "valetRods",
-  "tieRacks",
-  "beltRacks",
-  "hamper",
-  "jewelryInserts",
-  "hooks",
+  "drawerInserts", "valetRods", "tieRacks", "beltRacks", "hamper", "jewelryInserts", "hooks",
 ];
 
-export interface AccessoryDef {
-  label:     string;
-  unitPrice: number;
-}
+export interface AccessoryDef { label: string; unitPrice: number; }
 
 export const ACCESSORIES: Record<AccessoryKey, AccessoryDef> = {
   drawerInserts:  { label: "Drawer Inserts",  unitPrice: 48  },
@@ -148,104 +121,267 @@ export const ACCESSORIES: Record<AccessoryKey, AccessoryDef> = {
   hooks:          { label: "Hooks",           unitPrice: 14  },
 };
 
-// ─── Result shape ─────────────────────────────────────────────────────────────
+// ─── Layout counts ────────────────────────────────────────────────────────────
 
-export interface OptionLine {
-  key:       OptionKey;
-  label:     string;
-  qty:       number;
-  unitPrice: number;
-  total:     number;
+export interface LayoutCounts {
+  panelCount:        number;
+  sectionCount:      number;
+  shelfCount:        number;
+  drawerCount:       number;
+  rodCount:          number;
+  doorCount:         number;
+  wallWidthIn:       number;
+  ceilingH:          number;
+  systemHeightIn:    number;  // actual closet system height used for backing (panel height, not ceiling)
+  backingSquareFeet: number;
+}
+
+export function computeLayoutCounts(
+  sections:     PricingSection[],
+  wallWidthIn:  number,
+  ceilingH:     number,
+  panelHeights: number[],
+): LayoutCounts {
+  let shelfCount = 0, drawerCount = 0, rodCount = 0;
+  for (const sec of sections) {
+    shelfCount += 2;
+    for (const comp of sec.components) {
+      if (comp.type === "Shelf")       shelfCount++;
+      if (comp.type === "Rod")         rodCount++;
+      if (comp.type === "DrawerStack") drawerCount += comp.drawerHeights.length;
+    }
+  }
+
+  // Backing area = sum of (section width × actual section height) for all sections.
+  // Section height = min of its two bounding panel heights (clamped to ceilingH).
+  // This uses the real closet panel/system height, not the ceiling height.
+  let backingAreaIn2 = 0;
+  let totalWidthIn   = 0;
+  for (let i = 0; i < sections.length; i++) {
+    const leftH    = Math.min(panelHeights[i]     ?? ceilingH, ceilingH);
+    const rightH   = Math.min(panelHeights[i + 1] ?? ceilingH, ceilingH);
+    const sectionH = Math.min(leftH, rightH);
+    backingAreaIn2 += sections[i].widthIn * sectionH;
+    totalWidthIn   += sections[i].widthIn;
+  }
+  const backingSquareFeet = Math.round((backingAreaIn2 / 144) * 100) / 100;
+  // Effective system height: backing area divided by total width.
+  // For a uniform design this equals the panel height exactly.
+  const systemHeightIn = totalWidthIn > 0 ? Math.round(backingAreaIn2 / totalWidthIn) : 0;
+
+  return {
+    panelCount:   sections.length + 1,
+    sectionCount: sections.length,
+    shelfCount,
+    drawerCount,
+    rodCount,
+    doorCount:    0,
+    wallWidthIn,
+    ceilingH,
+    systemHeightIn,
+    backingSquareFeet,
+  };
+}
+
+// ─── Priced item (one billable entry) ────────────────────────────────────────
+
+export interface PricedItem {
+  label:           string;
+  originalPrice:   number;
+  discountedPrice: number; // originalPrice × (1 − LINE_DISCOUNT_RATE)
 }
 
 export interface AccessoryLine {
-  key:       AccessoryKey;
-  label:     string;
-  qty:       number;
-  unitPrice: number;
-  total:     number;
+  key:             AccessoryKey;
+  label:           string;
+  qty:             number;
+  unitOriginal:    number;
+  unitDiscounted:  number;
+  totalOriginal:   number;
+  totalDiscounted: number;
 }
 
+// ─── Result ───────────────────────────────────────────────────────────────────
+
 export interface PresentationResult {
-  layoutCounts:    LayoutCounts;
-  baseLineItems:   LineItem[];   // from base pricing engine
-  baseSubtotal:    number;       // raw component cost (before 11%)
-  baseAdjustment:  number;       // 11% adjustment
-  baseTotal:       number;       // baseSubtotal + adjustment (Everyday price)
-  tierMultiplier:  number;
-  tierUpgrade:     number;       // delta from material tier (0 for Everyday)
-  materialBase:    number;       // baseTotal × tierMultiplier
-  optionLines:     OptionLine[];  // only lines with total > 0
-  optionsTotal:    number;
-  accessoryLines:  AccessoryLine[];
-  accessoriesTotal: number;
-  subtotal:        number;       // materialBase + optionsTotal + accessoriesTotal
-  promoDiscount:   number;
-  finalTotal:      number;
-  warnings:        string[];
+  // Layout
+  layoutCounts:      LayoutCounts;
+  baseLineItems:     LineItem[];
+
+  // Step-by-step original prices (used to preview option impacts in the UI)
+  baseSubtotal:      number;
+  baseAdjustment:    number;
+  baseLayoutPrice:   number;   // base total incl. 11% — original, before discounts
+  tierRatePercent:   number;
+  tierUpgrade:       number;   // original delta
+  afterTierPrice:    number;   // used by material option preview
+  materialRatePercent: number;
+  materialUpgrade:   number;   // original delta
+  afterMaterialPrice: number;
+  backingRatePerSqFt: number;
+  backingSquareFeet:  number;
+  backingPrice:       number;  // original
+  decoTotalPieces:    number;
+  decoPricePerPiece:  number;
+  decoPrice:          number;  // original
+  accessoryLines:     AccessoryLine[];
+  accessoriesTotal:   number;  // original
+
+  // Discount layers
+  pricedItems:            PricedItem[]; // every billable item with both prices
+  subtotalBeforeDiscount: number;       // Σ originalPrice
+  discountAmount40:       number;       // subtotalBeforeDiscount × LINE_DISCOUNT_RATE
+  subtotalAfter40:        number;       // Σ discountedPrice
+  discountAmount15:       number;       // subtotalAfter40 × FINAL_DISCOUNT_RATE
+  finalTotal:             number;       // subtotalAfter40 × (1 − FINAL_DISCOUNT_RATE)
+
+  warnings: string[];
+}
+
+// ─── Helper ───────────────────────────────────────────────────────────────────
+
+function lineDiscount(original: number): number {
+  return Math.round(original * (1 - LINE_DISCOUNT_RATE) * 100) / 100;
 }
 
 // ─── Main engine ──────────────────────────────────────────────────────────────
 
 export function computePresentationPricing(
-  sections:        PricingSection[],
-  overallDepthIn:  number,
-  wallWidthIn:     number,
-  materialTier:    MaterialTier,
-  selectedOptions: Set<OptionKey>,
-  accessoryQtys:   Partial<Record<AccessoryKey, number>>,
-  promoDiscount:   number,
+  sections:       PricingSection[],
+  overallDepthIn: number,
+  wallWidthIn:    number,
+  ceilingH:       number,
+  panelHeights:   number[],
+  materialTier:   MaterialTier,
+  materialOption: MaterialOption,
+  backingOption:  BackingOption,
+  decoOption:     DecoOption,
+  accessoryQtys:  Partial<Record<AccessoryKey, number>>,
 ): PresentationResult {
   const base   = computePricing(sections, overallDepthIn);
-  const counts = computeLayoutCounts(sections, wallWidthIn);
+  const counts = computeLayoutCounts(sections, wallWidthIn, ceilingH, panelHeights);
+  const r2     = (n: number) => Math.round(n * 100) / 100;
 
-  // Material tier
-  const tierMultiplier = MATERIAL_TIERS[materialTier].multiplier;
-  const materialBase   = Math.round(base.total * tierMultiplier * 100) / 100;
-  const tierUpgrade    = Math.round((materialBase - base.total) * 100) / 100;
+  // ── Step-by-step original prices ─────────────────────────────────────────
 
-  // Options — skip $0 lines from the output (they are standard inclusions)
-  const optionLines: OptionLine[] = [];
-  for (const key of OPTION_ORDER) {
-    if (!selectedOptions.has(key)) continue;
-    const opt   = OPTIONS[key];
-    const qty   = opt.calcQty(counts);
-    const total = Math.round(qty * opt.unitPrice * 100) / 100;
-    if (total <= 0) continue; // standard/included — not a billable add-on
-    optionLines.push({ key, label: opt.label, qty, unitPrice: opt.unitPrice, total });
-  }
-  const optionsTotal = optionLines.reduce((s, o) => s + o.total, 0);
+  const baseLayoutPrice = base.total;
+
+  const tierRatePercent = MATERIAL_TIERS[materialTier].ratePercent;
+  const tierUpgrade     = r2(baseLayoutPrice * tierRatePercent / 100);
+  const afterTierPrice  = r2(baseLayoutPrice + tierUpgrade);
+
+  const materialRatePercent = MATERIAL_OPTIONS[materialOption].ratePercent;
+  const materialUpgrade     = r2(afterTierPrice * materialRatePercent / 100);
+  const afterMaterialPrice  = r2(afterTierPrice + materialUpgrade);
+
+  const backingDef   = BACKING_OPTIONS[backingOption];
+  const backingPrice = r2(counts.backingSquareFeet * backingDef.ratePerSqFt);
+
+  const decoDef         = DECO_OPTIONS[decoOption];
+  const decoTotalPieces = counts.drawerCount + counts.doorCount;
+  const decoPrice       = decoTotalPieces > 0 ? decoDef.pricePerPiece * decoTotalPieces : 0;
 
   // Accessories
   const accessoryLines: AccessoryLine[] = [];
   for (const key of ACCESSORY_ORDER) {
     const qty = accessoryQtys[key] ?? 0;
     if (qty <= 0) continue;
-    const acc   = ACCESSORIES[key];
-    const total = qty * acc.unitPrice;
-    accessoryLines.push({ key, label: acc.label, qty, unitPrice: acc.unitPrice, total });
+    const acc = ACCESSORIES[key];
+    const totalOrig = acc.unitPrice * qty;
+    accessoryLines.push({
+      key,
+      label:           acc.label,
+      qty,
+      unitOriginal:    acc.unitPrice,
+      unitDiscounted:  lineDiscount(acc.unitPrice),
+      totalOriginal:   totalOrig,
+      totalDiscounted: lineDiscount(totalOrig),
+    });
   }
-  const accessoriesTotal = accessoryLines.reduce((s, a) => s + a.total, 0);
+  const accessoriesTotal = accessoryLines.reduce((s, a) => s + a.totalOriginal, 0);
 
-  const subtotal   = materialBase + optionsTotal + accessoriesTotal;
-  const finalTotal = Math.max(0, Math.round((subtotal - promoDiscount) * 100) / 100);
+  // ── Build priced items list ───────────────────────────────────────────────
+  // Each item carries its own 40% discount.
+
+  const pricedItems: PricedItem[] = [];
+
+  if (baseLayoutPrice > 0) {
+    pricedItems.push({
+      label: "Base Layout",
+      originalPrice:   baseLayoutPrice,
+      discountedPrice: lineDiscount(baseLayoutPrice),
+    });
+  }
+  if (tierUpgrade > 0) {
+    pricedItems.push({
+      label: `System Tier — ${materialTier} (+${tierRatePercent}%)`,
+      originalPrice:   tierUpgrade,
+      discountedPrice: lineDiscount(tierUpgrade),
+    });
+  }
+  if (materialUpgrade > 0) {
+    pricedItems.push({
+      label: `Material — ${MATERIAL_OPTIONS[materialOption].label} (+${materialRatePercent}%)`,
+      originalPrice:   materialUpgrade,
+      discountedPrice: lineDiscount(materialUpgrade),
+    });
+  }
+  if (backingPrice > 0) {
+    pricedItems.push({
+      label: `Backing — ${backingDef.label} ${backingDef.spec} (${counts.backingSquareFeet} sqft)`,
+      originalPrice:   backingPrice,
+      discountedPrice: lineDiscount(backingPrice),
+    });
+  }
+  if (decoPrice > 0) {
+    pricedItems.push({
+      label: `Deco — ${decoDef.label} (${decoTotalPieces} piece${decoTotalPieces !== 1 ? "s" : ""})`,
+      originalPrice:   decoPrice,
+      discountedPrice: lineDiscount(decoPrice),
+    });
+  }
+  for (const al of accessoryLines) {
+    pricedItems.push({
+      label:           `${al.label} × ${al.qty}`,
+      originalPrice:   al.totalOriginal,
+      discountedPrice: al.totalDiscounted,
+    });
+  }
+
+  // ── Discount totals ───────────────────────────────────────────────────────
+
+  const subtotalBeforeDiscount = r2(pricedItems.reduce((s, i) => s + i.originalPrice, 0));
+  const subtotalAfter40        = r2(pricedItems.reduce((s, i) => s + i.discountedPrice, 0));
+  const discountAmount40       = r2(subtotalBeforeDiscount - subtotalAfter40);
+  const discountAmount15       = r2(subtotalAfter40 * FINAL_DISCOUNT_RATE);
+  const finalTotal             = r2(subtotalAfter40 * (1 - FINAL_DISCOUNT_RATE));
 
   return {
-    layoutCounts:    counts,
-    baseLineItems:   base.lineItems,
-    baseSubtotal:    base.subtotal,
-    baseAdjustment:  base.adjustment,
-    baseTotal:       base.total,
-    tierMultiplier,
+    layoutCounts:      counts,
+    baseLineItems:     base.lineItems,
+    baseSubtotal:      base.subtotal,
+    baseAdjustment:    base.adjustment,
+    baseLayoutPrice,
+    tierRatePercent,
     tierUpgrade,
-    materialBase,
-    optionLines,
-    optionsTotal,
+    afterTierPrice,
+    materialRatePercent,
+    materialUpgrade,
+    afterMaterialPrice,
+    backingRatePerSqFt: backingDef.ratePerSqFt,
+    backingSquareFeet:  counts.backingSquareFeet,
+    backingPrice,
+    decoTotalPieces,
+    decoPricePerPiece:  decoDef.pricePerPiece,
+    decoPrice,
     accessoryLines,
     accessoriesTotal,
-    subtotal,
-    promoDiscount,
+    pricedItems,
+    subtotalBeforeDiscount,
+    discountAmount40,
+    subtotalAfter40,
+    discountAmount15,
     finalTotal,
-    warnings:        base.warnings,
+    warnings: base.warnings,
   };
 }
