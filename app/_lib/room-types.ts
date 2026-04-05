@@ -21,6 +21,11 @@ export interface RoomSegment {
   // When set, the wall draws a smooth arc from start to end through this control point.
   cpDxIn?:           number;
   cpDyIn?:           number;
+  // Free-standing anchor — when set, this segment starts at (anchorX, anchorY) in
+  // room-coordinate space instead of being chained to the previous segment's end.
+  // Dragging the anchor handle moves the whole segment without changing its length/angle.
+  anchorX?:          number;
+  anchorY?:          number;
   usable:            boolean;           // physical: can cabinetry go here at all?
   selectedForDesign: boolean;           // user choice: "Has Closet" — include in design
   canHaveCabinetry:  boolean;
