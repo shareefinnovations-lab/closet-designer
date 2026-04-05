@@ -43,6 +43,10 @@ export interface RoomLayout {
   closetDepthIn:   number;
   // Perimeter segments (v2 model)
   segments:        RoomSegment[];
+  // Origin of vertex 0 in room-coordinate space (inches).
+  // Stored so that dragging vertex 0 behaves like any other vertex.
+  originX?:        number;
+  originY?:        number;
   // Legacy fields (v1) — kept only for data migration
   walls?:          RoomWall[];
   leftReturnIn?:   number;

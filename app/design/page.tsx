@@ -718,7 +718,7 @@ function WallCanvas({
   ceilingH:          number;
   selection:         Selection;
   onSelect:          (s: Selection) => void;
-  onDragStart:       (drag: DragState, e: React.MouseEvent) => void;
+  onDragStart:       (drag: DragState, e: React.PointerEvent) => void;
   onAddPanelAt:      (xIn: number) => void;
   cornerConstraints: CornerConstraint[];
   zoom:              number;
@@ -734,7 +734,7 @@ function WallCanvas({
   const sysX           = H_PAD + run.startIn * SCALE;
   const sysW           = (run.endIn - run.startIn) * SCALE;
 
-  function toXIn(e: React.MouseEvent): number {
+  function toXIn(e: { clientX: number }): number {
     const r = svgRef.current!.getBoundingClientRect();
     return ((e.clientX - r.left) / zoom - H_PAD) / SCALE;
   }
@@ -749,7 +749,7 @@ function WallCanvas({
   return (
     <svg ref={svgRef} width={svgW * zoom} height={svgH * zoom}
       viewBox={`0 0 ${svgW} ${svgH}`}
-      style={{ display: "block", userSelect: "none" }}>
+      style={{ display: "block", userSelect: "none", touchAction: "none" }}>
 
       {/* ── Height ruler — floor to ceiling ── */}
       <g pointerEvents="none">
@@ -905,13 +905,13 @@ function WallCanvas({
               const cH   = compHeight(comp);
               const cYPx = floorY(comp.positionIn + cH);
 
-              const startDrag = (e: React.MouseEvent) => {
+              const startDrag = (e: React.PointerEvent) => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "comp", secId: sec.id, compId: comp.id });
                 onDragStart({ kind: "comp", wallId: run.wallId, secId: sec.id, compId: comp.id,
                   startY: e.clientY, startPosIn: comp.positionIn }, e);
               };
-              const selectOnly = (e: React.MouseEvent) => {
+              const selectOnly = (e: React.PointerEvent) => {
                 e.stopPropagation();
                 onSelect({ kind: "comp", secId: sec.id, compId: comp.id });
               };
@@ -920,7 +920,7 @@ function WallCanvas({
               if (comp.type === "Shelf") return (
                 <g key={comp.id}
                   style={{ cursor: isLocked ? "default" : "ns-resize" }}
-                  onMouseDown={isLocked ? selectOnly : startDrag}>
+                  onPointerDown={isLocked ? selectOnly : startDrag}>
                   {!isLocked && (
                     <rect x={xPx} y={cYPx + 2} width={wPx} height={SCALE + 2}
                       fill="#c0a070" opacity={0.2} rx={1} />
@@ -947,7 +947,7 @@ function WallCanvas({
               if (comp.type === "Rod") return (
                 <g key={comp.id}
                   style={{ cursor: isLocked ? "default" : "ns-resize" }}
-                  onMouseDown={isLocked ? selectOnly : startDrag}>
+                  onPointerDown={isLocked ? selectOnly : startDrag}>
                   <rect x={xPx} y={cYPx} width={wPx} height={SCALE} fill="transparent" />
                   {isLocked ? (
                     <>
@@ -973,7 +973,7 @@ function WallCanvas({
                 const atLimit = top >= DRAWER_MAX_TOP - 1;
                 let dyAcc = 0;
                 return (
-                  <g key={comp.id} style={{ cursor: "ns-resize" }} onMouseDown={startDrag}>
+                  <g key={comp.id} style={{ cursor: "ns-resize" }} onPointerDown={startDrag}>
                     {atLimit && (
                       <rect x={xPx + 2} y={cYPx} width={wPx - 4} height={2}
                         fill="#e05050" opacity={0.6} pointerEvents="none" />
@@ -1008,7 +1008,7 @@ function WallCanvas({
         return (
           <g key={obs.id} style={{ cursor: "move" }}
             onClick={e => { e.stopPropagation(); onSelect({ kind: "obstacle", obsId: obs.id }); }}
-            onMouseDown={e => {
+            onPointerDown={e => {
               e.preventDefault(); e.stopPropagation();
               onSelect({ kind: "obstacle", obsId: obs.id });
               onDragStart({
@@ -1047,7 +1047,7 @@ function WallCanvas({
               stroke={isSel ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1}
               style={{ cursor: "ew-resize" }}
               onClick={e => { e.stopPropagation(); onSelect({ kind: "panel", panelId: panel.id }); }}
-              onMouseDown={e => {
+              onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "panel", panelId: panel.id });
                 onDragStart({ kind: "panel", wallId: run.wallId, panelIdx: pi,
@@ -1060,7 +1060,7 @@ function WallCanvas({
               stroke={isSel ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1}
               rx={3} style={{ cursor: "ns-resize" }}
               onClick={e => { e.stopPropagation(); onSelect({ kind: "panel", panelId: panel.id }); }}
-              onMouseDown={e => {
+              onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "panel", panelId: panel.id });
                 onDragStart({ kind: "panel-height", wallId: run.wallId, panelIdx: pi,
@@ -1095,7 +1095,7 @@ function WallCanvas({
               stroke={leftSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1.5}
               style={{ cursor: "ew-resize" }}
               onClick={e => { e.stopPropagation(); onSelect({ kind: "left-end" }); }}
-              onMouseDown={e => {
+              onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "left-end" });
                 onDragStart({ kind: "left-end", wallId: run.wallId, startX: e.clientX, startIn: run.startIn }, e);
@@ -1107,7 +1107,7 @@ function WallCanvas({
               stroke={leftSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1}
               rx={3} style={{ cursor: "ns-resize" }}
               onClick={e => { e.stopPropagation(); onSelect({ kind: "left-end" }); }}
-              onMouseDown={e => {
+              onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "left-end" });
                 onDragStart({ kind: "left-end-height", wallId: run.wallId,
@@ -1140,7 +1140,7 @@ function WallCanvas({
               stroke={rightSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1.5}
               style={{ cursor: "ew-resize" }}
               onClick={e => { e.stopPropagation(); onSelect({ kind: "right-end" }); }}
-              onMouseDown={e => {
+              onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "right-end" });
                 onDragStart({ kind: "right-end", wallId: run.wallId, startX: e.clientX, endIn: run.endIn }, e);
@@ -1152,7 +1152,7 @@ function WallCanvas({
               stroke={rightSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1}
               rx={3} style={{ cursor: "ns-resize" }}
               onClick={e => { e.stopPropagation(); onSelect({ kind: "right-end" }); }}
-              onMouseDown={e => {
+              onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "right-end" });
                 onDragStart({ kind: "right-end-height", wallId: run.wallId,
@@ -2777,7 +2777,7 @@ export default function DesignPage() {
   // ── Drag system ────────────────────────────────────────────────────────────
 
   useEffect(() => {
-    function onMove(e: MouseEvent) {
+    function onMove(e: PointerEvent) {
       const drag = dragRef.current;
       if (!drag) return;
 
@@ -2884,11 +2884,11 @@ export default function DesignPage() {
 
     function onUp() { dragRef.current = null; }
 
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup",   onUp);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup",   onUp);
     return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup",   onUp);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup",   onUp);
     };
   }, []);
 
@@ -3081,7 +3081,7 @@ export default function DesignPage() {
                     backgroundColor: "#fff",
                     border: `1px solid ${cornerConstraints.some(c => c.wallId === activeWall.id && c.violated) ? "#dc2626" : "#e5e0d8"}`,
                     borderRadius: "12px", padding: "28px 16px 14px",
-                    overflowX: "auto",
+                    overflowX: "auto", touchAction: "none",
                   }}>
                     <WallCanvas
                       run={activeRun}
