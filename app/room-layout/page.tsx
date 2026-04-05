@@ -62,10 +62,12 @@ function segStart(segs: RoomSegment[], pts: Point[], i: number): Point {
   return pts[i];
 }
 
-function isClosed(pts: Point[]): boolean {
-  if (pts.length < 4) return false; // need at least 3 segments to form a polygon
-  return Math.abs(pts[0][0] - pts[pts.length - 1][0]) < 0.5 &&
-         Math.abs(pts[0][1] - pts[pts.length - 1][1]) < 0.5;
+function isClosed(segs: RoomSegment[], pts: Point[]): boolean {
+  if (segs.length < 3 || pts.length <= segs.length) return false;
+  const firstStart = segStart(segs, pts, 0);
+  const lastEnd    = pts[pts.length - 1];
+  return Math.abs(firstStart[0] - lastEnd[0]) < 0.5 &&
+         Math.abs(firstStart[1] - lastEnd[1]) < 0.5;
 }
 
 /** Actual geometric length of a segment in inches. */
@@ -116,6 +118,42 @@ function segDxDy(seg: RoomSegment): [number, number] {
 /** True when a segment has a bezier curve control point. */
 function segHasCurve(seg: RoomSegment): boolean {
   return seg.cpDxIn !== undefined && seg.cpDyIn !== undefined;
+}
+
+// ─── Magnetic snap ────────────────────────────────────────────────────────────
+
+const SNAP_PX = 20; // screen-pixel radius for magnetic snap
+
+interface SnapTarget { id: string; pt: Point; }
+
+/** Collect all vertex + anchor positions as snap targets. */
+function buildSnapTargets(segs: RoomSegment[], pts: Point[]): SnapTarget[] {
+  const targets: SnapTarget[] = [];
+  for (let i = 0; i < pts.length; i++) {
+    targets.push({ id: `v:${i}`, pt: pts[i] });
+  }
+  for (const s of segs) {
+    if (s.anchorX !== undefined && s.anchorY !== undefined) {
+      targets.push({ id: `a:${s.id}`, pt: [s.anchorX, s.anchorY] });
+    }
+  }
+  return targets;
+}
+
+/** Find closest snap target within SNAP_PX screen pixels. Returns snapped Point or null. */
+function findSnap(
+  xIn: number, yIn: number,
+  targets: SnapTarget[], excludeId: string, scale: number,
+): Point | null {
+  const threshIn = SNAP_PX / scale;
+  let best: Point | null = null;
+  let bestD = threshIn;
+  for (const t of targets) {
+    if (t.id === excludeId) continue;
+    const d = Math.sqrt((t.pt[0] - xIn) ** 2 + (t.pt[1] - yIn) ** 2);
+    if (d < bestD) { bestD = d; best = t.pt; }
+  }
+  return best;
 }
 
 // ─── Quadratic Bézier helpers ─────────────────────────────────────────────────
@@ -340,6 +378,29 @@ interface TopViewRun {
 
 const TV_PANEL_W = 0.75;
 
+// ─── Opening type + computeOpenings ──────────────────────────────────────────
+
+interface Opening { pt1: Point; pt2: Point; widthIn: number; }
+
+/** Find all gaps (>0.5") between consecutive segment endpoints. */
+function computeOpenings(segs: RoomSegment[], pts: Point[]): Opening[] {
+  const MIN = 0.5;
+  const out: Opening[] = [];
+  for (let i = 0; i + 1 < segs.length; i++) {
+    const endPt  = pts[i + 1];
+    const nextSt = segStart(segs, pts, i + 1);
+    const gap    = Math.sqrt((endPt[0] - nextSt[0]) ** 2 + (endPt[1] - nextSt[1]) ** 2);
+    if (gap > MIN) out.push({ pt1: endPt, pt2: nextSt, widthIn: gap });
+  }
+  if (segs.length > 0 && pts.length > segs.length) {
+    const lastEnd = pts[pts.length - 1];
+    const firstSt = segStart(segs, pts, 0);
+    const gap     = Math.sqrt((lastEnd[0] - firstSt[0]) ** 2 + (lastEnd[1] - firstSt[1]) ** 2);
+    if (gap > MIN) out.push({ pt1: lastEnd, pt2: firstSt, widthIn: gap });
+  }
+  return out;
+}
+
 // ─── PerimeterCanvas ─────────────────────────────────────────────────────────
 // Interactive SVG floor-plan view.
 // Vertex handles (blue circles): drag to reshape room end-vertices.
@@ -347,7 +408,7 @@ const TV_PANEL_W = 0.75;
 // Curve handles (teal circles): drag to reshape bezier arc control point.
 
 function PerimeterCanvas({
-  segments, selectedId, onSelect, designRuns, onVertexDrag, onBreakpointDrag, onCurveDrag, onAnchorDrag, zoom, originPt,
+  segments, selectedId, onSelect, designRuns, onVertexDrag, onBreakpointDrag, onCurveDrag, onAnchorDrag, zoom, originPt, showLegend,
 }: {
   segments:         RoomSegment[];
   selectedId:       string | null;
@@ -359,19 +420,23 @@ function PerimeterCanvas({
   onAnchorDrag:     (segIdx: number, xIn: number, yIn: number) => void;
   zoom:             number;
   originPt:         Point;
+  showLegend:       boolean;
 }) {
-  const svgRef       = useRef<SVGSVGElement>(null);
-  const lockRef      = useRef<CanvasTransform | null>(null);
-  const cbRef        = useRef(onVertexDrag);
-  const bpCbRef      = useRef(onBreakpointDrag);
-  const cvCbRef      = useRef(onCurveDrag);
-  const anchorCbRef  = useRef(onAnchorDrag);
-  const lockBpRef    = useRef<{ segIdx: number; ptX: number; ptY: number } | null>(null);
-  const lockCvRef    = useRef<{ segIdx: number; ptX: number; ptY: number } | null>(null);
+  const svgRef          = useRef<SVGSVGElement>(null);
+  const lockRef         = useRef<CanvasTransform | null>(null);
+  const cbRef           = useRef(onVertexDrag);
+  const bpCbRef         = useRef(onBreakpointDrag);
+  const cvCbRef         = useRef(onCurveDrag);
+  const anchorCbRef     = useRef(onAnchorDrag);
+  const lockBpRef       = useRef<{ segIdx: number; ptX: number; ptY: number } | null>(null);
+  const lockCvRef       = useRef<{ segIdx: number; ptX: number; ptY: number } | null>(null);
+  const snapTargetsRef  = useRef<SnapTarget[]>([]);
+  const dragExcludeRef  = useRef<string>("");
   const [draggingVertex,     setDraggingVertex]     = useState<number | null>(null);
   const [draggingBreakpoint, setDraggingBreakpoint] = useState<number | null>(null);
   const [draggingCurve,      setDraggingCurve]      = useState<number | null>(null);
   const [draggingAnchor,     setDraggingAnchor]     = useState<number | null>(null);
+  const [snapTarget,         setSnapTarget]          = useState<Point | null>(null);
 
   useEffect(() => { cbRef.current      = onVertexDrag; });
   useEffect(() => { bpCbRef.current    = onBreakpointDrag; });
@@ -386,9 +451,14 @@ function PerimeterCanvas({
       if (!lockRef.current || !svgRef.current) return;
       const { scale, offX, offY, minX, minY } = lockRef.current;
       const rect = svgRef.current.getBoundingClientRect();
-      cbRef.current(vertexIdx, (e.clientX - rect.left - offX) / scale + minX, (e.clientY - rect.top - offY) / scale + minY);
+      const rawX = (e.clientX - rect.left - offX) / scale + minX;
+      const rawY = (e.clientY - rect.top  - offY) / scale + minY;
+      const snap = findSnap(rawX, rawY, snapTargetsRef.current, dragExcludeRef.current, scale);
+      setSnapTarget(snap);
+      const [xIn, yIn] = snap ?? [rawX, rawY];
+      cbRef.current(vertexIdx, xIn, yIn);
     }
-    function onUp() { setDraggingVertex(null); lockRef.current = null; }
+    function onUp() { setDraggingVertex(null); lockRef.current = null; setSnapTarget(null); }
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup",   onUp);
     return () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
@@ -438,11 +508,14 @@ function PerimeterCanvas({
       if (!lockRef.current || !svgRef.current) return;
       const { scale, offX, offY, minX, minY } = lockRef.current;
       const rect = svgRef.current.getBoundingClientRect();
-      anchorCbRef.current(segIdx,
-        (e.clientX - rect.left - offX) / scale + minX,
-        (e.clientY - rect.top  - offY) / scale + minY);
+      const rawX = (e.clientX - rect.left - offX) / scale + minX;
+      const rawY = (e.clientY - rect.top  - offY) / scale + minY;
+      const snap = findSnap(rawX, rawY, snapTargetsRef.current, dragExcludeRef.current, scale);
+      setSnapTarget(snap);
+      const [xIn, yIn] = snap ?? [rawX, rawY];
+      anchorCbRef.current(segIdx, xIn, yIn);
     }
-    function onUp() { setDraggingAnchor(null); lockRef.current = null; }
+    function onUp() { setDraggingAnchor(null); lockRef.current = null; setSnapTarget(null); }
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup",   onUp);
     return () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
@@ -463,7 +536,11 @@ function PerimeterCanvas({
   const xform  = lockRef.current ?? computeTransform(segments, zoom, originPt);
   const { scale, offX, offY, minX, minY } = xform;
   const pts    = computePoints(segments, originPt);
-  const closed = isClosed(pts);
+  const closed = isClosed(segments, pts);
+
+  // Keep snap targets fresh every render
+  snapTargetsRef.current = buildSnapTargets(segments, pts);
+  const openings = computeOpenings(segments, pts);
 
   const tx = (x: number) => offX + (x - minX) * scale;
   const ty = (y: number) => offY + (y - minY) * scale;
@@ -612,47 +689,41 @@ function PerimeterCanvas({
         );
       })}
 
-      {/* Opening indicator — shown when room is an open polygon (intentional door gap) */}
-      {!closed && pts.length > 1 && (() => {
-        const [ex, ey] = pts[pts.length - 1];
-        const [ox, oy] = pts[0];
-        const sx1 = tx(ex), sy1 = ty(ey), sx2 = tx(ox), sy2 = ty(oy);
-        const openingIn = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
+      {/* Opening indicators — one per gap between disconnected endpoints */}
+      {openings.map((op, oi) => {
+        const sx1 = tx(op.pt1[0]), sy1 = ty(op.pt1[1]);
+        const sx2 = tx(op.pt2[0]), sy2 = ty(op.pt2[1]);
         const dx = sx2 - sx1, dy = sy2 - sy1;
         const lenPx = Math.sqrt(dx * dx + dy * dy) || 1;
         const ux = dx / lenPx, uy = dy / lenPx;
-        // Perpendicular pointing inward (into the room) for label
         const nx = -uy * normalSign, ny = ux * normalSign;
         const midX = (sx1 + sx2) / 2, midY = (sy1 + sy2) / 2;
-        const lx = midX + nx * 20, ly = midY + ny * 20;
+        const lx = midX + nx * 22, ly = midY + ny * 22;
         const arrowLen = Math.min(12, lenPx * 0.15);
+        const wIn = Math.round(op.widthIn);
         return (
-          <g pointerEvents="none">
-            {/* Dashed opening line */}
+          <g key={oi} pointerEvents="none">
             <line x1={sx1} y1={sy1} x2={sx2} y2={sy2}
               stroke="#2563eb" strokeWidth={2} strokeDasharray="7 4" opacity={0.55} />
-            {/* End tick marks */}
             <line x1={sx1 - ny * 6} y1={sy1 + nx * 6} x2={sx1 + ny * 6} y2={sy1 - nx * 6}
               stroke="#2563eb" strokeWidth={2} opacity={0.7} />
             <line x1={sx2 - ny * 6} y1={sy2 + nx * 6} x2={sx2 + ny * 6} y2={sy2 - nx * 6}
               stroke="#2563eb" strokeWidth={2} opacity={0.7} />
-            {/* Arrows pointing inward */}
             {lenPx > 30 && <>
               <line x1={midX} y1={midY} x2={midX - ux * arrowLen} y2={midY - uy * arrowLen}
                 stroke="#2563eb" strokeWidth={1.5} opacity={0.65} />
               <line x1={midX} y1={midY} x2={midX + ux * arrowLen} y2={midY + uy * arrowLen}
                 stroke="#2563eb" strokeWidth={1.5} opacity={0.65} />
             </>}
-            {/* Label */}
             <rect x={lx - 34} y={ly - 9} width={68} height={16} rx={4}
               fill="rgba(239,246,255,0.92)" stroke="#93c5fd" strokeWidth={0.75} />
             <text x={lx} y={ly + 4} textAnchor="middle" fontSize={9}
               fill="#1d4ed8" fontWeight="800">
-              Opening: {openingIn}&quot;
+              Opening {openings.length > 1 ? `${oi + 1}: ` : ""}{wIn}&quot;
             </text>
           </g>
         );
-      })()}
+      })}
 
       {/* Wall segments — path for curves/breakpoints, line for straight */}
       {segments.map((seg, i) => {
@@ -719,6 +790,7 @@ function PerimeterCanvas({
         const fill       = isDragging ? "#2563eb" : "#4a90d9";
         const handler    = (e: React.PointerEvent) => {
           e.preventDefault(); e.stopPropagation();
+          dragExcludeRef.current = `v:${i}`;
           lockRef.current = computeTransform(segments, zoom, originPt);
           setDraggingVertex(i);
         };
@@ -744,6 +816,7 @@ function PerimeterCanvas({
             style={{ cursor: isDragging ? "grabbing" : "grab" }}
             onPointerDown={(e) => {
               e.preventDefault(); e.stopPropagation();
+              dragExcludeRef.current = `a:${seg.id}`;
               lockRef.current = computeTransform(segments, zoom, originPt);
               setDraggingAnchor(i);
             }}>
@@ -768,6 +841,7 @@ function PerimeterCanvas({
             style={{ cursor: isDragging ? "grabbing" : "grab" }}
             onPointerDown={(e) => {
               e.preventDefault(); e.stopPropagation();
+              dragExcludeRef.current = "";
               lockRef.current = computeTransform(segments, zoom, originPt);
               lockBpRef.current = { segIdx: i, ptX: wx1, ptY: wy1 };
               setDraggingBreakpoint(i);
@@ -802,6 +876,7 @@ function PerimeterCanvas({
               style={{ cursor: isDragging ? "grabbing" : "grab" }}
               onPointerDown={(e) => {
                 e.preventDefault(); e.stopPropagation();
+                dragExcludeRef.current = "";
                 lockRef.current = computeTransform(segments, zoom, originPt);
                 lockCvRef.current = { segIdx: i, ptX: wx1, ptY: wy1 };
                 setDraggingCurve(i);
@@ -816,40 +891,50 @@ function PerimeterCanvas({
         );
       })}
 
+      {/* Magnetic snap indicator */}
+      {snapTarget && (
+        <g pointerEvents="none">
+          <circle cx={tx(snapTarget[0])} cy={ty(snapTarget[1])} r={16}
+            fill="rgba(37,99,235,0.1)" stroke="#2563eb" strokeWidth={2} opacity={0.8} />
+          <circle cx={tx(snapTarget[0])} cy={ty(snapTarget[1])} r={22}
+            fill="none" stroke="#2563eb" strokeWidth={1} opacity={0.35} />
+        </g>
+      )}
+
       {/* Legend */}
-      <g pointerEvents="none">
-        <rect x={8} y={CANVAS_H - 122} width={148} height={115} rx={4}
-          fill="rgba(250,250,248,0.92)" stroke="#e8e4de" strokeWidth={0.75} />
-        <line x1={14} y1={CANVAS_H - 98} x2={26} y2={CANVAS_H - 98}
-          stroke="#15803d" strokeWidth={3} strokeLinecap="round" />
-        <text x={30} y={CANVAS_H - 94} fontSize={8} fill="#777">Has closet</text>
-        <line x1={14} y1={CANVAS_H - 84} x2={26} y2={CANVAS_H - 84}
-          stroke="#94a3b8" strokeWidth={2} strokeLinecap="round" />
-        <text x={30} y={CANVAS_H - 80} fontSize={8} fill="#777">No closet</text>
-        <circle cx={17} cy={CANVAS_H - 68} r={5} fill="#4a90d9" stroke="#fff" strokeWidth={1.5} />
-        <text x={30} y={CANVAS_H - 64} fontSize={8} fill="#777">Vertex (drag to reshape)</text>
-        <circle cx={17} cy={CANVAS_H - 55} r={5} fill="#f97316" stroke="#fff" strokeWidth={1.5} />
-        <text x={30} y={CANVAS_H - 51} fontSize={8} fill="#777">Anchor (drag free wall)</text>
-        <rect x={12} y={CANVAS_H - 47} width={10} height={10}
-          fill="#f59e0b" stroke="#fff" strokeWidth={1.5}
-          transform={`rotate(45 17 ${CANVAS_H - 42})`} />
-        <text x={30} y={CANVAS_H - 38} fontSize={8} fill="#777">Breakpoint (drag kink)</text>
-        <circle cx={17} cy={CANVAS_H - 27} r={5} fill="#06b6d4" stroke="#fff" strokeWidth={1.5} />
-        <text x={30} y={CANVAS_H - 23} fontSize={8} fill="#777">Curve control (drag arc)</text>
-        <rect x={13} y={CANVAS_H - 12} width={8} height={6} rx={1}
-          fill="rgba(195,155,100,0.45)" stroke="#c4935a" strokeWidth={0.75} />
-        <text x={30} y={CANVAS_H - 6} fontSize={8} fill="#777">Closet footprint</text>
-      </g>
+      {showLegend && (
+        <g pointerEvents="none">
+          <rect x={8} y={CANVAS_H - 122} width={148} height={115} rx={4}
+            fill="rgba(250,250,248,0.92)" stroke="#e8e4de" strokeWidth={0.75} />
+          <line x1={14} y1={CANVAS_H - 98} x2={26} y2={CANVAS_H - 98}
+            stroke="#15803d" strokeWidth={3} strokeLinecap="round" />
+          <text x={30} y={CANVAS_H - 94} fontSize={8} fill="#777">Has closet</text>
+          <line x1={14} y1={CANVAS_H - 84} x2={26} y2={CANVAS_H - 84}
+            stroke="#94a3b8" strokeWidth={2} strokeLinecap="round" />
+          <text x={30} y={CANVAS_H - 80} fontSize={8} fill="#777">No closet</text>
+          <circle cx={17} cy={CANVAS_H - 68} r={5} fill="#4a90d9" stroke="#fff" strokeWidth={1.5} />
+          <text x={30} y={CANVAS_H - 64} fontSize={8} fill="#777">Vertex (drag to reshape)</text>
+          <circle cx={17} cy={CANVAS_H - 55} r={5} fill="#f97316" stroke="#fff" strokeWidth={1.5} />
+          <text x={30} y={CANVAS_H - 51} fontSize={8} fill="#777">Anchor (drag free wall)</text>
+          <rect x={12} y={CANVAS_H - 47} width={10} height={10}
+            fill="#f59e0b" stroke="#fff" strokeWidth={1.5}
+            transform={`rotate(45 17 ${CANVAS_H - 42})`} />
+          <text x={30} y={CANVAS_H - 38} fontSize={8} fill="#777">Breakpoint (drag kink)</text>
+          <circle cx={17} cy={CANVAS_H - 27} r={5} fill="#06b6d4" stroke="#fff" strokeWidth={1.5} />
+          <text x={30} y={CANVAS_H - 23} fontSize={8} fill="#777">Curve control (drag arc)</text>
+          <rect x={13} y={CANVAS_H - 12} width={8} height={6} rx={1}
+            fill="rgba(195,155,100,0.45)" stroke="#c4935a" strokeWidth={0.75} />
+          <text x={30} y={CANVAS_H - 6} fontSize={8} fill="#777">Closet footprint</text>
+        </g>
+      )}
 
       {/* Open/closed status */}
       <text x={CANVAS_W - 8} y={CANVAS_H - 8} textAnchor="end" fontSize={9} fontWeight="700"
         fill={closed ? "#15803d" : "#2563eb"} pointerEvents="none">
-        {closed ? "✓ Closed room" : (() => {
-          const [ex, ey] = pts[pts.length - 1];
-          const [ox, oy] = pts[0];
-          const w = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
-          return `↔ Opening: ${w}"`;
-        })()}
+        {closed ? "✓ Closed room" : openings.length === 0 ? "○ Open" :
+          openings.length === 1
+            ? `↔ Opening: ${Math.round(openings[0].widthIn)}"`
+            : `↔ ${openings.length} openings`}
       </text>
     </svg>
   );
@@ -1318,6 +1403,7 @@ export default function RoomLayoutPage() {
   const [ready,        setReady]        = useState(false);
   const [roomZoom,     setRoomZoom]     = useState(1.0);
   const [originPt,     setOriginPt]     = useState<Point>([0, 0]);
+  const [showLegend,   setShowLegend]   = useState(true);
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
@@ -1518,7 +1604,7 @@ export default function RoomLayoutPage() {
 
       // If closed, seg[N-1] ends at vertex 0.
       // Its new vector = (newXIn, newYIn) - pts[N-1].
-      if (isClosed(pts) && segments.length > 1) {
+      if (isClosed(segments, pts) && segments.length > 1) {
         const N = segments.length;
         const [pxN1, pyN1] = pts[N - 1];
         const dx = newXIn - pxN1, dy = newYIn - pyN1;
@@ -1797,6 +1883,12 @@ export default function RoomLayoutPage() {
                   onClick={() => setRoomZoom(1)}
                   title="Reset zoom"
                   style={ZS.reset}>Reset</button>
+                <button
+                  onClick={() => setShowLegend(v => !v)}
+                  title={showLegend ? "Hide legend" : "Show legend"}
+                  style={{ ...ZS.reset, marginLeft: "4px" }}>
+                  {showLegend ? "Hide legend" : "Legend"}
+                </button>
               </div>
             </div>
             <div style={{ overflow: "hidden", borderRadius: "8px" }}>
@@ -1811,6 +1903,7 @@ export default function RoomLayoutPage() {
                 onAnchorDrag={handleAnchorDrag}
                 zoom={roomZoom}
                 originPt={originPt}
+                showLegend={showLegend}
               />
             </div>
             {designRuns.length > 0 && (
