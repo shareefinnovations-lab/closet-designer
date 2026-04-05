@@ -2458,7 +2458,8 @@ function RoomTopView({
           d += ` L ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
         }
       }
-      return d + " Z";
+      // Only close the path if the room is actually closed; leave open shapes open.
+      return closed ? d + " Z" : d;
     }
 
     /** Actual Euclidean length of a segment (correct for slanted/curved). */
@@ -2637,10 +2638,42 @@ function RoomTopView({
           <text x={26} y={RTV_H - 10} fontSize={8} fill="#777">No closet</text>
         </g>
 
+        {/* Opening indicator for open shapes */}
+        {!closed && pts.length > 1 && (() => {
+          const [ex, ey] = pts[pts.length - 1];
+          const [ox, oy] = (layout.originX !== undefined && layout.originY !== undefined)
+            ? [layout.originX, layout.originY] : [0, 0];
+          const sx1 = tx(ex), sy1 = ty(ey), sx2 = tx(ox), sy2 = ty(oy);
+          const openW = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
+          const dx = sx2 - sx1, dy = sy2 - sy1;
+          const lenPx = Math.sqrt(dx*dx + dy*dy) || 1;
+          const nx = -dy/lenPx * normalSign, ny = dx/lenPx * normalSign;
+          const midX = (sx1 + sx2) / 2, midY = (sy1 + sy2) / 2;
+          const lx = midX + nx * 18, ly = midY + ny * 18;
+          return (
+            <g pointerEvents="none">
+              <line x1={sx1} y1={sy1} x2={sx2} y2={sy2}
+                stroke="#2563eb" strokeWidth={2} strokeDasharray="6 3" opacity={0.5} />
+              <rect x={lx - 30} y={ly - 8} width={60} height={14} rx={3}
+                fill="rgba(239,246,255,0.92)" stroke="#93c5fd" strokeWidth={0.5} />
+              <text x={lx} y={ly + 3} textAnchor="middle" fontSize={8}
+                fill="#1d4ed8" fontWeight="800">
+                Opening {openW}&quot;
+              </text>
+            </g>
+          );
+        })()}
+
         {/* Closed status */}
         <text x={RTV_W - 8} y={RTV_H - 8} textAnchor="end" fontSize={9} fontWeight="700"
-          fill={closed ? "#15803d" : "#dc2626"} pointerEvents="none">
-          {closed ? "✓ Closed room" : "○ Open room"}
+          fill={closed ? "#15803d" : "#2563eb"} pointerEvents="none">
+          {closed ? "✓ Closed room" : (() => {
+            const [ex, ey] = pts[pts.length - 1];
+            const [ox, oy] = (layout.originX !== undefined && layout.originY !== undefined)
+              ? [layout.originX, layout.originY] : [0, 0];
+            const w = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
+            return `↔ Opening: ${w}"`;
+          })()}
         </text>
       </svg>
     );

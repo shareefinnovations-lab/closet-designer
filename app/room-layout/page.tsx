@@ -217,6 +217,50 @@ function makeDefault(wallWidthIn = 120, depth = 84): RoomSegment[] {
   ];
 }
 
+// ─── Closet room templates ────────────────────────────────────────────────────
+// These create open or closed polygons for common closet configurations.
+// "Up" = into the closet (back of closet at top of canvas).
+// Origin sits at the left end of the door opening.
+
+/** Reach-In: left return + back wall + right return (open front = door opening). */
+function makeReachIn(wallWidthIn = 120, returnDepthIn = 24): RoomSegment[] {
+  _id = 1;
+  return [
+    { ...makeSeg("up",    returnDepthIn), selectedForDesign: true, label: "Left Return" },
+    { ...makeSeg("right", wallWidthIn),   selectedForDesign: true, label: "Back Wall"   },
+    { ...makeSeg("down",  returnDepthIn), selectedForDesign: true, label: "Right Return"},
+  ];
+}
+
+/** L-Shape: left return + back wall. Opening is along the right/front side. */
+function makeLShape(wallWidthIn = 120, returnDepthIn = 24): RoomSegment[] {
+  _id = 1;
+  return [
+    { ...makeSeg("up",    returnDepthIn), selectedForDesign: true, label: "Left Return" },
+    { ...makeSeg("right", wallWidthIn),   selectedForDesign: true, label: "Back Wall"   },
+  ];
+}
+
+/** L-Shape (right): back wall + right return. Opening is along the left/front side. */
+function makeLShapeRight(wallWidthIn = 120, returnDepthIn = 24): RoomSegment[] {
+  _id = 1;
+  return [
+    { ...makeSeg("right", wallWidthIn),   selectedForDesign: true, label: "Back Wall"    },
+    { ...makeSeg("down",  returnDepthIn), selectedForDesign: true, label: "Right Return" },
+  ];
+}
+
+/** Walk-In: 4 closed walls. Front wall (door) is not for closet design. */
+function makeWalkIn(widthIn = 120, depthIn = 72): RoomSegment[] {
+  _id = 1;
+  return [
+    { ...makeSeg("right", widthIn),  selectedForDesign: true,  label: "Back Wall"    },
+    { ...makeSeg("down",  depthIn),  selectedForDesign: true,  label: "Right Side"   },
+    { ...makeSeg("left",  widthIn),  selectedForDesign: false, label: "Front (Door)" },
+    { ...makeSeg("up",    depthIn),  selectedForDesign: true,  label: "Left Side"    },
+  ];
+}
+
 // ─── Wall labels ──────────────────────────────────────────────────────────────
 
 const WALL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -518,14 +562,47 @@ function PerimeterCanvas({
         );
       })}
 
-      {/* Open shape indicator */}
-      {!closed && pts.length > 1 && (
-        <line
-          x1={tx(pts[pts.length - 1][0])} y1={ty(pts[pts.length - 1][1])}
-          x2={tx(pts[0][0])}              y2={ty(pts[0][1])}
-          stroke="#dc2626" strokeWidth={1} strokeDasharray="5,3" opacity={0.35}
-        />
-      )}
+      {/* Opening indicator — shown when room is an open polygon (intentional door gap) */}
+      {!closed && pts.length > 1 && (() => {
+        const [ex, ey] = pts[pts.length - 1];
+        const [ox, oy] = pts[0];
+        const sx1 = tx(ex), sy1 = ty(ey), sx2 = tx(ox), sy2 = ty(oy);
+        const openingIn = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
+        const dx = sx2 - sx1, dy = sy2 - sy1;
+        const lenPx = Math.sqrt(dx * dx + dy * dy) || 1;
+        const ux = dx / lenPx, uy = dy / lenPx;
+        // Perpendicular pointing inward (into the room) for label
+        const nx = -uy * normalSign, ny = ux * normalSign;
+        const midX = (sx1 + sx2) / 2, midY = (sy1 + sy2) / 2;
+        const lx = midX + nx * 20, ly = midY + ny * 20;
+        const arrowLen = Math.min(12, lenPx * 0.15);
+        return (
+          <g pointerEvents="none">
+            {/* Dashed opening line */}
+            <line x1={sx1} y1={sy1} x2={sx2} y2={sy2}
+              stroke="#2563eb" strokeWidth={2} strokeDasharray="7 4" opacity={0.55} />
+            {/* End tick marks */}
+            <line x1={sx1 - ny * 6} y1={sy1 + nx * 6} x2={sx1 + ny * 6} y2={sy1 - nx * 6}
+              stroke="#2563eb" strokeWidth={2} opacity={0.7} />
+            <line x1={sx2 - ny * 6} y1={sy2 + nx * 6} x2={sx2 + ny * 6} y2={sy2 - nx * 6}
+              stroke="#2563eb" strokeWidth={2} opacity={0.7} />
+            {/* Arrows pointing inward */}
+            {lenPx > 30 && <>
+              <line x1={midX} y1={midY} x2={midX - ux * arrowLen} y2={midY - uy * arrowLen}
+                stroke="#2563eb" strokeWidth={1.5} opacity={0.65} />
+              <line x1={midX} y1={midY} x2={midX + ux * arrowLen} y2={midY + uy * arrowLen}
+                stroke="#2563eb" strokeWidth={1.5} opacity={0.65} />
+            </>}
+            {/* Label */}
+            <rect x={lx - 34} y={ly - 9} width={68} height={16} rx={4}
+              fill="rgba(239,246,255,0.92)" stroke="#93c5fd" strokeWidth={0.75} />
+            <text x={lx} y={ly + 4} textAnchor="middle" fontSize={9}
+              fill="#1d4ed8" fontWeight="800">
+              Opening: {openingIn}&quot;
+            </text>
+          </g>
+        );
+      })()}
 
       {/* Wall segments — path for curves/breakpoints, line for straight */}
       {segments.map((seg, i) => {
@@ -689,8 +766,13 @@ function PerimeterCanvas({
 
       {/* Open/closed status */}
       <text x={CANVAS_W - 8} y={CANVAS_H - 8} textAnchor="end" fontSize={9} fontWeight="700"
-        fill={closed ? "#15803d" : "#64748b"} pointerEvents="none">
-        {closed ? "✓ Closed room" : "○ Open shape"}
+        fill={closed ? "#15803d" : "#2563eb"} pointerEvents="none">
+        {closed ? "✓ Closed room" : (() => {
+          const [ex, ey] = pts[pts.length - 1];
+          const [ox, oy] = pts[0];
+          const w = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
+          return `↔ Opening: ${w}"`;
+        })()}
       </text>
     </svg>
   );
@@ -1405,6 +1487,60 @@ export default function RoomLayoutPage() {
 
         {/* LEFT COLUMN — wall list + dimensions + continue */}
         <div style={{ width: "340px", flexShrink: 0 }}>
+
+          {/* Quick Templates */}
+          <div style={DS.card}>
+            <p style={{ ...DS.cardTitle, marginBottom: "10px" }}>Room Templates</p>
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              {([
+                {
+                  label: "Reach-In (Back + 2 Returns)",
+                  sub:   "Left return · back wall · right return · open front",
+                  fn:    () => makeReachIn(120, 24),
+                },
+                {
+                  label: "L-Shape (Back + Left Return)",
+                  sub:   "Left return · back wall · open right/front",
+                  fn:    () => makeLShape(120, 24),
+                },
+                {
+                  label: "L-Shape (Back + Right Return)",
+                  sub:   "Back wall · right return · open left/front",
+                  fn:    () => makeLShapeRight(120, 24),
+                },
+                {
+                  label: "Walk-In Closet (4 Walls)",
+                  sub:   "Back wall · two sides · front wall (door, no closet)",
+                  fn:    () => makeWalkIn(120, 72),
+                },
+                {
+                  label: "Rectangular Room",
+                  sub:   "Standard 4-wall closed room",
+                  fn:    () => makeDefault(120, 84),
+                },
+              ] as { label: string; sub: string; fn: () => RoomSegment[] }[]).map(({ label, sub, fn }) => (
+                <button key={label}
+                  onClick={() => {
+                    const segs = fn();
+                    setSegments(segs);
+                    setSelectedId(segs[0]?.id ?? null);
+                    setOriginPt([0, 0]);
+                  }}
+                  style={{
+                    padding: "9px 12px", fontSize: "12px", fontWeight: "600",
+                    textAlign: "left", border: "1px solid #d8d3cb", borderRadius: "7px",
+                    cursor: "pointer", backgroundColor: "#fafaf8", color: "#333",
+                    width: "100%",
+                  }}>
+                  <div style={{ fontWeight: "700", color: "#1a1a1a" }}>{label}</div>
+                  <div style={{ fontSize: "10px", color: "#888", marginTop: "2px" }}>{sub}</div>
+                </button>
+              ))}
+            </div>
+            <p style={{ fontSize: "10px", color: "#aaa", marginTop: "8px", marginBottom: 0 }}>
+              Replaces current walls. Adjust lengths in the wall editor after applying.
+            </p>
+          </div>
 
           {/* Wall list */}
           <div style={DS.card}>
