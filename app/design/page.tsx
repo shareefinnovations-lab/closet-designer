@@ -5,6 +5,10 @@ import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import type { RoomLayout, DesignWall, RoomSegment } from "@/app/_lib/room-types";
 import { getSelectedWalls, getDesignWalls } from "@/app/_lib/room-types";
+import {
+  type Point, computePoints, segStart, isClosed,
+  computeTransform, computeSignedArea, makeWallPtFn, buildRoomPath,
+} from "@/app/_lib/room-geo";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -264,29 +268,33 @@ function runMovePanel(run: WallRun, panelIdx: number, newX: number): WallRun {
 function runMoveLeftEnd(run: WallRun, newStart: number): WallRun {
   const firstPanelX = run.panels.length > 0 ? run.panels[0].xIn : run.endIn;
   let maxStart = firstPanelX - MIN_SEC_W;
-  // Enforce DRAWER_MAX_W for first section if it contains DrawerStack
+  let minStart = 0;
+  // DrawerStack: prevent section from exceeding DRAWER_MAX_W (can still shrink freely)
   if (run.sections[0]?.comps.some(c => c.type === "DrawerStack")) {
-    maxStart = Math.min(maxStart, firstPanelX - DRAWER_MAX_W);
+    minStart = Math.max(minStart, firstPanelX - DRAWER_MAX_W);
   }
+  // Shelf/Rod: prevent section from exceeding MAX_SPAN_IN (can still shrink freely)
   if (run.sections[0]?.comps.some(c => c.type === "Shelf" || c.type === "Rod")) {
-    maxStart = Math.min(maxStart, firstPanelX - MAX_SPAN_IN);
+    minStart = Math.max(minStart, firstPanelX - MAX_SPAN_IN);
   }
-  return { ...run, startIn: Math.max(0, Math.min(maxStart, newStart)) };
+  return { ...run, startIn: Math.max(minStart, Math.max(0, Math.min(maxStart, newStart))) };
 }
 
 function runMoveRightEnd(run: WallRun, newEnd: number, wallW: number): WallRun {
   const last         = run.panels[run.panels.length - 1];
   const lastSecStart = last ? last.xIn + PANEL_W_IN : run.startIn;
   let minEnd         = lastSecStart + MIN_SEC_W;
-  // Enforce DRAWER_MAX_W for last section if it contains DrawerStack
+  let maxEnd         = wallW;
+  // DrawerStack: prevent section from exceeding DRAWER_MAX_W (can still shrink freely)
   const lastSec = run.sections[run.sections.length - 1];
   if (lastSec?.comps.some(c => c.type === "DrawerStack")) {
-    minEnd = Math.max(minEnd, lastSecStart + DRAWER_MAX_W);
+    maxEnd = Math.min(maxEnd, lastSecStart + DRAWER_MAX_W);
   }
+  // Shelf/Rod: prevent section from exceeding MAX_SPAN_IN (can still shrink freely)
   if (lastSec?.comps.some(c => c.type === "Shelf" || c.type === "Rod")) {
-    minEnd = Math.max(minEnd, lastSecStart + MAX_SPAN_IN);
+    maxEnd = Math.min(maxEnd, lastSecStart + MAX_SPAN_IN);
   }
-  return { ...run, endIn: Math.max(minEnd, Math.min(wallW, newEnd)) };
+  return { ...run, endIn: Math.max(minEnd, Math.min(maxEnd, Math.min(wallW, newEnd))) };
 }
 
 function runUpdatePanel(run: WallRun, panelId: number, u: Partial<Panel>): WallRun {
@@ -330,6 +338,10 @@ function runAddComp(run: WallRun, secId: number, type: CompType, sysH: number): 
   // Shelf/Rod not allowed in sections wider than MAX_SPAN_IN
   if (type === "Shelf" || type === "Rod") {
     if (si !== -1 && secWidth(run.panels, run.startIn, run.endIn, si) > MAX_SPAN_IN) return run;
+  }
+  // DrawerStack not allowed in sections wider than DRAWER_MAX_W
+  if (type === "DrawerStack") {
+    if (si !== -1 && secWidth(run.panels, run.startIn, run.endIn, si) > DRAWER_MAX_W) return run;
   }
   // Use section effective height (min of bounding panels) for default placement
   const effH = si >= 0 ? sectionEffH(run, si, sysH) : sysH;
@@ -925,22 +937,19 @@ function WallCanvas({
                     <rect x={xPx} y={cYPx + 2} width={wPx} height={SCALE + 2}
                       fill="#c0a070" opacity={0.2} rx={1} />
                   )}
-                  {/* Shelf spans full section width — panel face to panel face */}
+                  {/* Shelf spans full section width — consistent appearance at all widths */}
                   <rect x={xPx} y={cYPx} width={wPx} height={SCALE}
-                    fill={isSC ? "#e8d5b8" : (isLocked ? "#a89878" : C_SHELF)}
-                    stroke={isSC ? C_SELECT : (isLocked ? "#806848" : C_SHELF_BD)}
+                    fill={isSC ? "#e8d5b8" : C_SHELF}
+                    stroke={isSC ? C_SELECT : C_SHELF_BD}
                     strokeWidth={isSC ? 2 : 1}
-                    strokeDasharray={isLocked && !isSC ? "5 3" : "none"}
                     rx={0} />
-                  {!isLocked && (
-                    <line x1={xPx} y1={cYPx + 1} x2={xPx + wPx} y2={cYPx + 1}
-                      stroke="#fff" strokeWidth={1} opacity={0.4} pointerEvents="none" />
-                  )}
+                  <line x1={xPx} y1={cYPx + 1} x2={xPx + wPx} y2={cYPx + 1}
+                    stroke="#fff" strokeWidth={1} opacity={0.4} pointerEvents="none" />
                   {/* Shelf pin marks at each panel face */}
                   <rect x={xPx} y={cYPx - 3} width={3} height={SCALE + 6}
-                    fill={isSC ? C_SELECT : (isLocked ? "#706848" : C_PANEL_BD)} opacity={0.5} pointerEvents="none" />
+                    fill={isSC ? C_SELECT : C_PANEL_BD} opacity={0.5} pointerEvents="none" />
                   <rect x={xPx + wPx - 3} y={cYPx - 3} width={3} height={SCALE + 6}
-                    fill={isSC ? C_SELECT : (isLocked ? "#706848" : C_PANEL_BD)} opacity={0.5} pointerEvents="none" />
+                    fill={isSC ? C_SELECT : C_PANEL_BD} opacity={0.5} pointerEvents="none" />
                 </g>
               );
 
@@ -949,21 +958,9 @@ function WallCanvas({
                   style={{ cursor: isLocked ? "default" : "ns-resize" }}
                   onPointerDown={isLocked ? selectOnly : startDrag}>
                   <rect x={xPx} y={cYPx} width={wPx} height={SCALE} fill="transparent" />
-                  {isLocked ? (
-                    <>
-                      {/* Locked rod — dashed line spanning full section */}
-                      <line x1={xPx} y1={cYPx + 3} x2={xPx + wPx} y2={cYPx + 3}
-                        stroke={isSC ? C_SELECT : "#604838"} strokeWidth={3}
-                        strokeDasharray="8 4" pointerEvents="none" />
-                      <rect x={xPx} y={cYPx} width={3} height={SCALE}
-                        fill={isSC ? C_SELECT : C_ROD} pointerEvents="none" />
-                      <rect x={xPx + wPx - 3} y={cYPx} width={3} height={SCALE}
-                        fill={isSC ? C_SELECT : C_ROD} pointerEvents="none" />
-                    </>
-                  ) : (
-                    <RodWithHangers xPx={xPx} wPx={wPx} cYPx={cYPx}
-                      wallH={wallH} padTop={SYSTEM_TOP_Y} lockH={LOCK_H_PX} selected={isSC} />
-                  )}
+                  {/* Rod — consistent appearance at all widths */}
+                  <RodWithHangers xPx={xPx} wPx={wPx} cYPx={cYPx}
+                    wallH={wallH} padTop={SYSTEM_TOP_Y} lockH={LOCK_H_PX} selected={isSC} />
                 </g>
               );
 
@@ -1742,17 +1739,28 @@ function Inspector({
           </p>
           <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
             {(["Shelf", "Rod", "DrawerStack"] as CompType[]).map(type => {
-              const blocked = (type === "Shelf" || type === "Rod") && sw > MAX_SPAN_IN;
+              const blocked =
+                ((type === "Shelf" || type === "Rod") && sw > MAX_SPAN_IN) ||
+                (type === "DrawerStack" && sw > DRAWER_MAX_W);
+              const blockReason =
+                (type === "Shelf" || type === "Rod")
+                  ? `Section must be ≤ ${MAX_SPAN_IN}" to add ${type}`
+                  : `Drawers require section width of ${DRAWER_MAX_W}" or less`;
               return (
                 <button key={type} disabled={blocked}
                   style={{ ...rowBtn(), opacity: blocked ? 0.4 : 1, cursor: blocked ? "not-allowed" : "pointer" }}
                   onClick={() => !blocked && onAddComp(sec.id, type)}
-                  title={blocked ? `Section must be ≤ ${MAX_SPAN_IN}" for ${type}` : undefined}>
+                  title={blocked ? blockReason : undefined}>
                   + {type === "DrawerStack" ? "Drawers" : type}
                 </button>
               );
             })}
           </div>
+          {sw > DRAWER_MAX_W && (
+            <p style={{ margin: "8px 0 0", fontSize: "10px", color: "#b07040", lineHeight: 1.4 }}>
+              Drawers require section width of {DRAWER_MAX_W}" or less.
+            </p>
+          )}
         </div>
 
         {sec.comps.length > 0 && (
@@ -2318,148 +2326,22 @@ function RoomTopView({
 
   // ── PERIMETER VIEW ───────────────────────────────────────────────────────
   if (hasPerimeter) {
-    // Build perimeter points — one end vertex per segment
-    const pts: [number, number][] = [[0, 0]];
-    for (const s of segments) {
-      const [x, y] = pts[pts.length - 1];
-      if (s.dxIn !== undefined && s.dyIn !== undefined) {
-        pts.push([x + s.dxIn, y + s.dyIn]);
-      } else {
-        switch (s.direction) {
-          case "right": pts.push([x + s.lengthIn, y]); break;
-          case "left":  pts.push([x - s.lengthIn, y]); break;
-          case "down":  pts.push([x, y + s.lengthIn]); break;
-          case "up":    pts.push([x, y - s.lengthIn]); break;
-        }
-      }
-    }
+    // All geometry via shared room-geo module — identical to Room Layout Builder.
+    const _origin: Point = (layout.originX !== undefined && layout.originY !== undefined)
+      ? [layout.originX, layout.originY] : [0, 0];
+    const pts = computePoints(segments, _origin);
 
-    // Include bezier control points in bounding box so arcs don't get clipped
-    const allPts: [number, number][] = [...pts];
-    for (let i = 0; i < segments.length; i++) {
-      const s = segments[i];
-      if (s.cpDxIn !== undefined && s.cpDyIn !== undefined) {
-        allPts.push([pts[i][0] + s.cpDxIn, pts[i][1] + s.cpDyIn]);
-      }
-    }
-
-    const xs     = allPts.map(p => p[0]);
-    const ys     = allPts.map(p => p[1]);
-    const minX   = Math.min(...xs), maxX = Math.max(...xs);
-    const minY   = Math.min(...ys), maxY = Math.max(...ys);
-    const drawW  = RTV_W - RTV_PAD * 2;
-    const drawH  = RTV_H - RTV_PAD * 2;
-    const pscale = Math.min(drawW / Math.max(maxX - minX, 1), drawH / Math.max(maxY - minY, 1));
-    const offX   = RTV_PAD + (drawW - (maxX - minX) * pscale) / 2;
-    const offY   = RTV_PAD + (drawH - (maxY - minY) * pscale) / 2;
-
+    const { scale: pscale, offX, offY, minX, minY } =
+      computeTransform(segments, 1, _origin, RTV_W, RTV_H, RTV_PAD);
     const tx = (x: number) => offX + (x - minX) * pscale;
     const ty = (y: number) => offY + (y - minY) * pscale;
 
-    const signedArea = (() => {
-      const n = pts.length - 1;
-      let s = 0;
-      for (let i = 0; i < n; i++) s += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1];
-      return s;
-    })();
-    const normalSign = signedArea >= 0 ? 1 : -1;
-
-    // Quadratic bezier helpers (inline for self-contained component)
-    function _qBez(t: number, p0: [number,number], p1: [number,number], p2: [number,number]): [number,number] {
-      const mt = 1 - t;
-      return [mt*mt*p0[0]+2*mt*t*p1[0]+t*t*p2[0], mt*mt*p0[1]+2*mt*t*p1[1]+t*t*p2[1]];
-    }
-    function _qBezTan(t: number, p0: [number,number], p1: [number,number], p2: [number,number]): [number,number] {
-      const mt = 1 - t;
-      return [2*mt*(p1[0]-p0[0])+2*t*(p2[0]-p1[0]), 2*mt*(p1[1]-p0[1])+2*t*(p2[1]-p1[1])];
-    }
-    function _arcTable(p0: [number,number], p1: [number,number], p2: [number,number]) {
-      const tbl: {t:number;s:number}[] = [{t:0,s:0}];
-      let prev = p0;
-      for (let i = 1; i <= 64; i++) {
-        const ti = i/64, cur = _qBez(ti, p0, p1, p2);
-        tbl.push({t:ti, s:tbl[tbl.length-1].s + Math.sqrt((cur[0]-prev[0])**2+(cur[1]-prev[1])**2)});
-        prev = cur;
-      }
-      return tbl;
-    }
-    function _arcToT(tbl: {t:number;s:number}[], s: number): number {
-      const tot = tbl[tbl.length-1].s;
-      if (s <= 0) return 0; if (s >= tot) return 1;
-      let lo = 0, hi = tbl.length - 1;
-      while (hi - lo > 1) { const m=(lo+hi)>>1; if (tbl[m].s<=s) lo=m; else hi=m; }
-      const sp = tbl[hi].s - tbl[lo].s;
-      return tbl[lo].t + (sp<0.0001?0:(s-tbl[lo].s)/sp) * (tbl[hi].t-tbl[lo].t);
-    }
-
-    function wallPt(segIdx: number, alongIn: number, depthIn: number): [number, number] {
-      const [wx1, wy1] = pts[segIdx];
-      if (segIdx + 1 >= pts.length) return [tx(wx1), ty(wy1)];
-      const [wx2, wy2] = pts[segIdx + 1];
-      const seg = segments[segIdx];
-
-      // Bezier curve
-      if (seg.cpDxIn !== undefined && seg.cpDyIn !== undefined) {
-        const p0: [number,number] = [wx1, wy1];
-        const p1: [number,number] = [wx1 + seg.cpDxIn, wy1 + seg.cpDyIn];
-        const p2: [number,number] = [wx2, wy2];
-        const tbl = _arcTable(p0, p1, p2);
-        const t   = _arcToT(tbl, alongIn);
-        const [bx, by]   = _qBez(t, p0, p1, p2);
-        const [tdx, tdy] = _qBezTan(t, p0, p1, p2);
-        const tl = Math.sqrt(tdx*tdx+tdy*tdy)||1;
-        const nx = -tdy/tl*normalSign, ny = tdx/tl*normalSign;
-        return [tx(bx + nx*depthIn), ty(by + ny*depthIn)];
-      }
-
-      // Breakpoint
-      if (seg.breakDxIn !== undefined && seg.breakDyIn !== undefined) {
-        const bx = wx1+seg.breakDxIn, by = wy1+seg.breakDyIn;
-        const l1 = Math.sqrt(seg.breakDxIn**2+seg.breakDyIn**2);
-        const l2dx = wx2-bx, l2dy = wy2-by;
-        const l2 = Math.sqrt(l2dx**2+l2dy**2);
-        if (l1 > 0.01 && alongIn <= l1) {
-          const ux=seg.breakDxIn/l1, uy=seg.breakDyIn/l1;
-          const nx=-uy*normalSign, ny=ux*normalSign;
-          return [tx(wx1+ux*alongIn+nx*depthIn), ty(wy1+uy*alongIn+ny*depthIn)];
-        }
-        if (l2 < 0.01) return [tx(bx), ty(by)];
-        const ux=l2dx/l2, uy=l2dy/l2;
-        const nx=-uy*normalSign, ny=ux*normalSign;
-        return [tx(bx+ux*(alongIn-l1)+nx*depthIn), ty(by+uy*(alongIn-l1)+ny*depthIn)];
-      }
-
-      // Straight
-      const wlen = Math.sqrt((wx2-wx1)**2+(wy2-wy1)**2);
-      if (wlen < 0.01) return [tx(wx1), ty(wy1)];
-      const ux=(wx2-wx1)/wlen, uy=(wy2-wy1)/wlen;
-      const nx=-uy*normalSign, ny=ux*normalSign;
-      return [tx(wx1+ux*alongIn+nx*depthIn), ty(wy1+uy*alongIn+ny*depthIn)];
-    }
+    const normalSign = computeSignedArea(segments, pts) >= 0 ? 1 : -1;
+    const closed     = isClosed(segments, pts);
+    const wallPt     = makeWallPtFn(segments, pts, normalSign, tx, ty);
 
     function ptStr(...coords: [number, number][]): string {
       return coords.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
-    }
-
-    /** Build SVG path for room perimeter, respecting curves and breakpoints. */
-    function buildPerimPath(): string {
-      if (pts.length < 2) return "";
-      let d = `M ${tx(pts[0][0]).toFixed(1)} ${ty(pts[0][1]).toFixed(1)}`;
-      for (let i = 0; i < segments.length && i+1 < pts.length; i++) {
-        const seg = segments[i];
-        const [ex, ey] = pts[i+1];
-        if (seg.cpDxIn !== undefined && seg.cpDyIn !== undefined) {
-          const cpx = tx(pts[i][0]+seg.cpDxIn), cpy = ty(pts[i][1]+seg.cpDyIn);
-          d += ` Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-        } else if (seg.breakDxIn !== undefined && seg.breakDyIn !== undefined) {
-          const bx = tx(pts[i][0]+seg.breakDxIn), by = ty(pts[i][1]+seg.breakDyIn);
-          d += ` L ${bx.toFixed(1)} ${by.toFixed(1)} L ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-        } else {
-          d += ` L ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-        }
-      }
-      // Only close the path if the room is actually closed; leave open shapes open.
-      return closed ? d + " Z" : d;
     }
 
     /** Actual Euclidean length of a segment (correct for slanted/curved). */
@@ -2468,10 +2350,6 @@ function RoomTopView({
         return Math.sqrt(seg.dxIn**2 + seg.dyIn**2);
       return seg.lengthIn;
     }
-
-    const closed = pts.length > 1 &&
-      Math.abs(pts[0][0] - pts[pts.length-1][0]) < 0.5 &&
-      Math.abs(pts[0][1] - pts[pts.length-1][1]) < 0.5;
 
     return (
       <svg width={RTV_W * zoom} height={RTV_H * zoom}
@@ -2486,13 +2364,15 @@ function RoomTopView({
 
         {/* Room fill */}
         {closed && (
-          <path d={buildPerimPath()} fill="rgba(255,255,255,0.70)" />
+          <path d={buildRoomPath(segments, pts, closed, tx, ty)} fill="rgba(255,255,255,0.70)" />
         )}
 
         {/* Closet footprints */}
         {runs.map(run => {
           const segIdx = segments.findIndex(s => s.id === run.wallId);
           if (segIdx < 0 || segIdx >= pts.length - 1 || run.sections.length === 0) return null;
+          // fd: flip depth sign if footprintFlipped is set on this wall
+          const fd = (d: number) => segments[segIdx].footprintFlipped ? -d : d;
           return (
             <g key={run.wallId} pointerEvents="none">
               {run.sections.map((sec, si) => {
@@ -2501,8 +2381,8 @@ function RoomTopView({
                 if (rx <= lx) return null;
                 const a   = wallPt(segIdx, lx, 0);
                 const b   = wallPt(segIdx, rx, 0);
-                const c   = wallPt(segIdx, rx, sec.depthIn);
-                const dpt = wallPt(segIdx, lx, sec.depthIn);
+                const c   = wallPt(segIdx, rx, fd(sec.depthIn));
+                const dpt = wallPt(segIdx, lx, fd(sec.depthIn));
                 return (
                   <polygon key={sec.id} points={ptStr(a, b, c, dpt)}
                     fill="rgba(195,155,100,0.38)" stroke="#c4935a" strokeWidth={1} />
@@ -2514,8 +2394,8 @@ function RoomTopView({
                 const maxD = Math.max(lD, rD);
                 const a = wallPt(segIdx, panel.xIn, 0);
                 const b = wallPt(segIdx, panel.xIn + PANEL_W_IN, 0);
-                const c = wallPt(segIdx, panel.xIn + PANEL_W_IN, maxD);
-                const dpt = wallPt(segIdx, panel.xIn, maxD);
+                const c = wallPt(segIdx, panel.xIn + PANEL_W_IN, fd(maxD));
+                const dpt = wallPt(segIdx, panel.xIn, fd(maxD));
                 return (
                   <polygon key={panel.id} points={ptStr(a, b, c, dpt)}
                     fill="#b8956a" stroke="#8b6437" strokeWidth={0.5} />
@@ -2526,12 +2406,12 @@ function RoomTopView({
                 const dN = run.sections[run.sections.length-1].depthIn;
                 const la = wallPt(segIdx, run.startIn, 0);
                 const lb = wallPt(segIdx, run.startIn + PANEL_W_IN, 0);
-                const lc = wallPt(segIdx, run.startIn + PANEL_W_IN, d0);
-                const ld = wallPt(segIdx, run.startIn, d0);
+                const lc = wallPt(segIdx, run.startIn + PANEL_W_IN, fd(d0));
+                const ld = wallPt(segIdx, run.startIn, fd(d0));
                 const ra = wallPt(segIdx, run.endIn - PANEL_W_IN, 0);
                 const rb = wallPt(segIdx, run.endIn, 0);
-                const rc = wallPt(segIdx, run.endIn, dN);
-                const rd = wallPt(segIdx, run.endIn - PANEL_W_IN, dN);
+                const rc = wallPt(segIdx, run.endIn, fd(dN));
+                const rd = wallPt(segIdx, run.endIn - PANEL_W_IN, fd(dN));
                 return (
                   <>
                     <polygon points={ptStr(la, lb, lc, ld)} fill="#b8956a" stroke="#8b6437" strokeWidth={1} />
@@ -2542,8 +2422,8 @@ function RoomTopView({
               {(() => {
                 const maxD = Math.max(...run.sections.map(s => s.depthIn));
                 const midAlong = (run.startIn + run.endIn) / 2;
-                const [mx, my] = wallPt(segIdx, midAlong, maxD / 2);
-                const [wx1, wy1] = pts[segIdx];
+                const [mx, my] = wallPt(segIdx, midAlong, fd(maxD / 2));
+                const [wx1, wy1] = segStart(segments, pts,segIdx);
                 const [wx2, wy2] = pts[segIdx+1] ?? pts[segIdx];
                 const wl = Math.sqrt((wx2-wx1)**2+(wy2-wy1)**2);
                 if (wl < 0.01) return null;
@@ -2563,7 +2443,7 @@ function RoomTopView({
         {/* Wall lines + labels */}
         {segments.map((seg, i) => {
           if (i >= pts.length - 1) return null;
-          const [x1, y1] = pts[i];
+          const [x1, y1] = segStart(segments, pts,i);
           const [x2, y2] = pts[i + 1];
           const sx1 = tx(x1), sy1 = ty(y1), sx2 = tx(x2), sy2 = ty(y2);
           const hasRun  = runs.some(r => r.wallId === seg.id);
@@ -2590,8 +2470,9 @@ function RoomTopView({
           const lOffset = 14;
           const lx = midX + pnx * lOffset, ly = midY + pny * lOffset;
 
-          const designLabel  = wallLabelMap.get(seg.id);
-          const displayLabel = designLabel ?? (seg.label?.trim() || null);
+          // Always label by segment index (matching Room Layout Builder: Wall A = first segment)
+          const _WALL_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+          const displayLabel  = `Wall ${_WALL_LETTERS[i] ?? String(i + 1)}`;
           const lenStr       = Math.round(segLen(seg)) + '"';
 
           return (
@@ -2617,11 +2498,14 @@ function RoomTopView({
           );
         })}
 
-        {/* Corner dots */}
-        {pts.slice(0, -1).map(([x, y], i) => (
-          <circle key={`dot${i}`} cx={tx(x)} cy={ty(y)} r={i === 0 ? 5 : 3}
-            fill={i === 0 ? "#1a1a1a" : "#999"} pointerEvents="none" />
-        ))}
+        {/* Corner dots — use actual segment starts (anchor-aware) */}
+        {segments.map((_, i) => {
+          const [x, y] = segStart(segments, pts,i);
+          return (
+            <circle key={`dot${i}`} cx={tx(x)} cy={ty(y)} r={i === 0 ? 5 : 3}
+              fill={i === 0 ? "#1a1a1a" : "#999"} pointerEvents="none" />
+          );
+        })}
 
         {/* Legend */}
         <g pointerEvents="none">
@@ -2638,42 +2522,10 @@ function RoomTopView({
           <text x={26} y={RTV_H - 10} fontSize={8} fill="#777">No closet</text>
         </g>
 
-        {/* Opening indicator for open shapes */}
-        {!closed && pts.length > 1 && (() => {
-          const [ex, ey] = pts[pts.length - 1];
-          const [ox, oy] = (layout.originX !== undefined && layout.originY !== undefined)
-            ? [layout.originX, layout.originY] : [0, 0];
-          const sx1 = tx(ex), sy1 = ty(ey), sx2 = tx(ox), sy2 = ty(oy);
-          const openW = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
-          const dx = sx2 - sx1, dy = sy2 - sy1;
-          const lenPx = Math.sqrt(dx*dx + dy*dy) || 1;
-          const nx = -dy/lenPx * normalSign, ny = dx/lenPx * normalSign;
-          const midX = (sx1 + sx2) / 2, midY = (sy1 + sy2) / 2;
-          const lx = midX + nx * 18, ly = midY + ny * 18;
-          return (
-            <g pointerEvents="none">
-              <line x1={sx1} y1={sy1} x2={sx2} y2={sy2}
-                stroke="#2563eb" strokeWidth={2} strokeDasharray="6 3" opacity={0.5} />
-              <rect x={lx - 30} y={ly - 8} width={60} height={14} rx={3}
-                fill="rgba(239,246,255,0.92)" stroke="#93c5fd" strokeWidth={0.5} />
-              <text x={lx} y={ly + 3} textAnchor="middle" fontSize={8}
-                fill="#1d4ed8" fontWeight="800">
-                Opening {openW}&quot;
-              </text>
-            </g>
-          );
-        })()}
-
         {/* Closed status */}
         <text x={RTV_W - 8} y={RTV_H - 8} textAnchor="end" fontSize={9} fontWeight="700"
           fill={closed ? "#15803d" : "#2563eb"} pointerEvents="none">
-          {closed ? "✓ Closed room" : (() => {
-            const [ex, ey] = pts[pts.length - 1];
-            const [ox, oy] = (layout.originX !== undefined && layout.originY !== undefined)
-              ? [layout.originX, layout.originY] : [0, 0];
-            const w = Math.round(Math.sqrt((ex - ox) ** 2 + (ey - oy) ** 2));
-            return `↔ Opening: ${w}"`;
-          })()}
+          {closed ? "✓ Closed room" : "○ Open"}
         </text>
       </svg>
     );

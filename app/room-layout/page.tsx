@@ -10,6 +10,14 @@ import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import type { RoomLayout, RoomSegment, SegmentDirection } from "@/app/_lib/room-types";
 import type { Config } from "@/app/elevation/_lib/types";
+import {
+  type Point, type CanvasTransform, type SnapTarget,
+  computePoints, segStart, isClosed,
+  segLength, segAngleDeg, segIsSlanted, segHasBreakpoint, segHasCurve, segDxDy,
+  dirSymbol, setSegAngle, setSegLen, snapOrthogonal,
+  SNAP_PX, buildSnapTargets, findSnap,
+  computeTransform, computeSignedArea, makeWallPtFn, buildRoomPath,
+} from "@/app/_lib/room-geo";
 
 // ─── ID counter ───────────────────────────────────────────────────────────────
 
@@ -19,236 +27,6 @@ function seedId(segs: RoomSegment[]): void {
   const nums = segs.map(s => Number(s.id)).filter(n => !isNaN(n) && n > 0);
   const max  = nums.reduce((m, n) => Math.max(m, n), 0);
   if (max >= _id) _id = max + 1;
-}
-
-// ─── Geometry helpers ─────────────────────────────────────────────────────────
-
-type Point = [number, number];
-
-/**
- * Compute polygon vertices from segment chain. First vertex is at `origin` (default [0,0]).
- * If a segment has anchorX/anchorY the chain "teleports" to that position instead of
- * continuing from the previous segment's end.  pts[i+1] is always the END of segment[i].
- */
-function computePoints(segs: RoomSegment[], origin: Point = [0, 0]): Point[] {
-  const pts: Point[] = [origin];
-  for (const s of segs) {
-    const prev = pts[pts.length - 1];
-    const [x, y] = (s.anchorX !== undefined && s.anchorY !== undefined)
-      ? [s.anchorX, s.anchorY]
-      : prev;
-    if (s.dxIn !== undefined && s.dyIn !== undefined) {
-      pts.push([x + s.dxIn, y + s.dyIn]);
-    } else {
-      switch (s.direction) {
-        case "right": pts.push([x + s.lengthIn, y]); break;
-        case "left":  pts.push([x - s.lengthIn, y]); break;
-        case "down":  pts.push([x, y + s.lengthIn]); break;
-        case "up":    pts.push([x, y - s.lengthIn]); break;
-      }
-    }
-  }
-  return pts;
-}
-
-/**
- * Returns the actual start position of segment i.
- * For anchored (free-standing) segments this is anchorX/Y.
- * For chained segments this is pts[i] (the accumulated chain position).
- */
-function segStart(segs: RoomSegment[], pts: Point[], i: number): Point {
-  const s = segs[i];
-  if (s.anchorX !== undefined && s.anchorY !== undefined) return [s.anchorX, s.anchorY];
-  return pts[i];
-}
-
-function isClosed(segs: RoomSegment[], pts: Point[]): boolean {
-  if (segs.length < 3 || pts.length <= segs.length) return false;
-  const firstStart = segStart(segs, pts, 0);
-  const lastEnd    = pts[pts.length - 1];
-  return Math.abs(firstStart[0] - lastEnd[0]) < 0.5 &&
-         Math.abs(firstStart[1] - lastEnd[1]) < 0.5;
-}
-
-/** Actual geometric length of a segment in inches. */
-function segLength(seg: RoomSegment): number {
-  if (seg.dxIn !== undefined && seg.dyIn !== undefined) {
-    return Math.sqrt(seg.dxIn * seg.dxIn + seg.dyIn * seg.dyIn);
-  }
-  return seg.lengthIn;
-}
-
-/** Angle of a segment in degrees (0° = right/east, 90° = down/south). */
-function segAngleDeg(seg: RoomSegment): number {
-  if (seg.dxIn !== undefined && seg.dyIn !== undefined) {
-    return Math.atan2(seg.dyIn, seg.dxIn) * 180 / Math.PI;
-  }
-  switch (seg.direction) {
-    case "right": return 0;
-    case "down":  return 90;
-    case "left":  return 180;
-    case "up":    return 270;
-  }
-}
-
-/** True when a segment is not perfectly orthogonal. */
-function segIsSlanted(seg: RoomSegment): boolean {
-  if (seg.dxIn === undefined || seg.dyIn === undefined) return false;
-  const eps = 0.1;
-  return Math.abs(seg.dxIn) > eps && Math.abs(seg.dyIn) > eps;
-}
-
-/** True when a segment has a breakpoint (two sub-legs). */
-function segHasBreakpoint(seg: RoomSegment): boolean {
-  return seg.breakDxIn !== undefined && seg.breakDyIn !== undefined;
-}
-
-/** Resolve segment's dx/dy vector (even for legacy direction-based segments). */
-function segDxDy(seg: RoomSegment): [number, number] {
-  if (seg.dxIn !== undefined && seg.dyIn !== undefined) return [seg.dxIn, seg.dyIn];
-  const l = seg.lengthIn;
-  switch (seg.direction) {
-    case "right": return [l,  0];
-    case "down":  return [0,  l];
-    case "left":  return [-l, 0];
-    case "up":    return [0, -l];
-  }
-}
-
-/** True when a segment has a bezier curve control point. */
-function segHasCurve(seg: RoomSegment): boolean {
-  return seg.cpDxIn !== undefined && seg.cpDyIn !== undefined;
-}
-
-// ─── Magnetic snap ────────────────────────────────────────────────────────────
-
-const SNAP_PX = 20; // screen-pixel radius for magnetic snap
-
-interface SnapTarget { id: string; pt: Point; }
-
-/** Collect all vertex + anchor positions as snap targets. */
-function buildSnapTargets(segs: RoomSegment[], pts: Point[]): SnapTarget[] {
-  const targets: SnapTarget[] = [];
-  for (let i = 0; i < pts.length; i++) {
-    targets.push({ id: `v:${i}`, pt: pts[i] });
-  }
-  for (const s of segs) {
-    if (s.anchorX !== undefined && s.anchorY !== undefined) {
-      targets.push({ id: `a:${s.id}`, pt: [s.anchorX, s.anchorY] });
-    }
-  }
-  return targets;
-}
-
-/** Find closest snap target within SNAP_PX screen pixels. Returns snapped Point or null. */
-function findSnap(
-  xIn: number, yIn: number,
-  targets: SnapTarget[], excludeId: string, scale: number,
-): Point | null {
-  const threshIn = SNAP_PX / scale;
-  let best: Point | null = null;
-  let bestD = threshIn;
-  for (const t of targets) {
-    if (t.id === excludeId) continue;
-    const d = Math.sqrt((t.pt[0] - xIn) ** 2 + (t.pt[1] - yIn) ** 2);
-    if (d < bestD) { bestD = d; best = t.pt; }
-  }
-  return best;
-}
-
-// ─── Quadratic Bézier helpers ─────────────────────────────────────────────────
-
-/** Evaluate quadratic bezier point at t ∈ [0,1]. */
-function qBez(t: number, p0: Point, p1: Point, p2: Point): Point {
-  const mt = 1 - t;
-  return [mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0],
-          mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1]];
-}
-
-/** Evaluate quadratic bezier tangent vector at t (NOT normalized). */
-function qBezTan(t: number, p0: Point, p1: Point, p2: Point): Point {
-  const mt = 1 - t;
-  return [2 * mt * (p1[0] - p0[0]) + 2 * t * (p2[0] - p1[0]),
-          2 * mt * (p1[1] - p0[1]) + 2 * t * (p2[1] - p1[1])];
-}
-
-const BEZIER_SAMPLES = 64;
-
-/**
- * Build a cumulative arc-length lookup table for a quadratic bezier.
- * Returns array of {t, s} with s = cumulative arc length at t.
- */
-function bezierArcTable(p0: Point, p1: Point, p2: Point): { t: number; s: number }[] {
-  const table: { t: number; s: number }[] = [{ t: 0, s: 0 }];
-  let prev = p0;
-  for (let i = 1; i <= BEZIER_SAMPLES; i++) {
-    const ti   = i / BEZIER_SAMPLES;
-    const curr = qBez(ti, p0, p1, p2);
-    const ds   = Math.sqrt((curr[0] - prev[0]) ** 2 + (curr[1] - prev[1]) ** 2);
-    table.push({ t: ti, s: table[table.length - 1].s + ds });
-    prev = curr;
-  }
-  return table;
-}
-
-/** Given an arc-length table and target arc length s, return the bezier parameter t. */
-function arcLengthToT(table: { t: number; s: number }[], s: number): number {
-  const total = table[table.length - 1].s;
-  if (s <= 0) return 0;
-  if (s >= total) return 1;
-  let lo = 0, hi = table.length - 1;
-  while (hi - lo > 1) {
-    const mid = (lo + hi) >> 1;
-    if (table[mid].s <= s) lo = mid; else hi = mid;
-  }
-  const span = table[hi].s - table[lo].s;
-  const frac = span < 0.0001 ? 0 : (s - table[lo].s) / span;
-  return table[lo].t + frac * (table[hi].t - table[lo].t);
-}
-
-/** 8-direction compass symbol for display. */
-function dirSymbol(seg: RoomSegment): string {
-  const a = ((segAngleDeg(seg)) % 360 + 360) % 360;
-  if (a < 22.5 || a >= 337.5) return "→";
-  if (a < 67.5)  return "↘";
-  if (a < 112.5) return "↓";
-  if (a < 157.5) return "↙";
-  if (a < 202.5) return "←";
-  if (a < 247.5) return "↖";
-  if (a < 292.5) return "↑";
-  return "↗";
-}
-
-/** Set segment to a specific angle (degrees), keeping length. */
-function setSegAngle(seg: RoomSegment, angleDeg: number): RoomSegment {
-  const len = Math.max(1, segLength(seg));
-  const rad = angleDeg * Math.PI / 180;
-  const dx  = len * Math.cos(rad);
-  const dy  = len * Math.sin(rad);
-  return { ...seg, dxIn: dx, dyIn: dy, lengthIn: Math.round(len) };
-}
-
-/** Set segment to a specific length, keeping direction. */
-function setSegLen(seg: RoomSegment, newLen: number): RoomSegment {
-  const len = Math.max(1, newLen);
-  if (seg.dxIn !== undefined && seg.dyIn !== undefined) {
-    const oldLen = Math.sqrt(seg.dxIn * seg.dxIn + seg.dyIn * seg.dyIn);
-    if (oldLen > 0.01) {
-      const s = len / oldLen;
-      return { ...seg, dxIn: seg.dxIn * s, dyIn: seg.dyIn * s, lengthIn: Math.round(len) };
-    }
-  }
-  return { ...seg, lengthIn: Math.round(len) };
-}
-
-/** Snap segment to an orthogonal direction, keeping current length. */
-function snapOrthogonal(seg: RoomSegment, dir: SegmentDirection): RoomSegment {
-  const len = Math.max(1, Math.round(segLength(seg)));
-  const map: Record<SegmentDirection, [number, number]> = {
-    right: [len, 0], down: [0, len], left: [-len, 0], up: [0, -len],
-  };
-  const [dx, dy] = map[dir];
-  return { ...seg, dxIn: dx, dyIn: dy, direction: dir, lengthIn: len };
 }
 
 // ─── Segment factory ──────────────────────────────────────────────────────────
@@ -324,44 +102,15 @@ function wallLetter(index: number): string { return WALL_LETTERS[index] ?? Strin
 function wallLabel(index: number): string  { return `Wall ${wallLetter(index)}`; }
 function segLabel(_seg: RoomSegment, index: number): string { return wallLabel(index); }
 
-// ─── Canvas transform ────────────────────────────────────────────────────────
-
-interface CanvasTransform {
-  scale: number; offX: number; offY: number; minX: number; minY: number;
-}
+// ─── Canvas constants + transform wrapper ─────────────────────────────────────
 
 const CANVAS_W   = 520;
 const CANVAS_H   = 380;
 const CANVAS_PAD = 54;
 
-function computeTransform(segs: RoomSegment[], zoom = 1, origin: Point = [0, 0]): CanvasTransform {
-  const pts  = computePoints(segs, origin);
-  // Include anchor positions, bezier control points so everything fits in the viewport
-  const allPts: Point[] = [...pts];
-  for (let i = 0; i < segs.length; i++) {
-    const s = segs[i];
-    if (s.anchorX !== undefined && s.anchorY !== undefined) {
-      allPts.push([s.anchorX, s.anchorY]);
-    }
-    if (s.cpDxIn !== undefined && s.cpDyIn !== undefined) {
-      const [sx, sy] = segStart(segs, pts, i);
-      allPts.push([sx + s.cpDxIn, sy + s.cpDyIn]);
-    }
-  }
-  const xs   = allPts.map(p => p[0]);
-  const ys   = allPts.map(p => p[1]);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const rangeX = Math.max(maxX - minX, 1);
-  const rangeY = Math.max(maxY - minY, 1);
-  const drawW  = CANVAS_W - CANVAS_PAD * 2;
-  const drawH  = CANVAS_H - CANVAS_PAD * 2;
-  const baseScale = Math.min(drawW / rangeX, drawH / rangeY);
-  const scale     = baseScale * zoom;
-  // Keep room centered regardless of zoom level
-  const offX = CANVAS_W / 2 - (rangeX / 2) * scale;
-  const offY = CANVAS_H / 2 - (rangeY / 2) * scale;
-  return { scale, offX, offY, minX, minY };
+/** Page-local wrapper: fills in the fixed canvas dimensions for this page. */
+function pageTransform(segs: RoomSegment[], zoom = 1, origin: Point = [0, 0]): CanvasTransform {
+  return computeTransform(segs, zoom, origin, CANVAS_W, CANVAS_H, CANVAS_PAD);
 }
 
 // ─── Design overlay types ─────────────────────────────────────────────────────
@@ -378,29 +127,6 @@ interface TopViewRun {
 
 const TV_PANEL_W = 0.75;
 
-// ─── Opening type + computeOpenings ──────────────────────────────────────────
-
-interface Opening { pt1: Point; pt2: Point; widthIn: number; }
-
-/** Find all gaps (>0.5") between consecutive segment endpoints. */
-function computeOpenings(segs: RoomSegment[], pts: Point[]): Opening[] {
-  const MIN = 0.5;
-  const out: Opening[] = [];
-  for (let i = 0; i + 1 < segs.length; i++) {
-    const endPt  = pts[i + 1];
-    const nextSt = segStart(segs, pts, i + 1);
-    const gap    = Math.sqrt((endPt[0] - nextSt[0]) ** 2 + (endPt[1] - nextSt[1]) ** 2);
-    if (gap > MIN) out.push({ pt1: endPt, pt2: nextSt, widthIn: gap });
-  }
-  if (segs.length > 0 && pts.length > segs.length) {
-    const lastEnd = pts[pts.length - 1];
-    const firstSt = segStart(segs, pts, 0);
-    const gap     = Math.sqrt((lastEnd[0] - firstSt[0]) ** 2 + (lastEnd[1] - firstSt[1]) ** 2);
-    if (gap > MIN) out.push({ pt1: lastEnd, pt2: firstSt, widthIn: gap });
-  }
-  return out;
-}
-
 // ─── PerimeterCanvas ─────────────────────────────────────────────────────────
 // Interactive SVG floor-plan view.
 // Vertex handles (blue circles): drag to reshape room end-vertices.
@@ -408,7 +134,8 @@ function computeOpenings(segs: RoomSegment[], pts: Point[]): Opening[] {
 // Curve handles (teal circles): drag to reshape bezier arc control point.
 
 function PerimeterCanvas({
-  segments, selectedId, onSelect, designRuns, onVertexDrag, onBreakpointDrag, onCurveDrag, onAnchorDrag, zoom, originPt, showLegend,
+  segments, selectedId, onSelect, designRuns, onVertexDrag, onBreakpointDrag, onCurveDrag, onAnchorDrag,
+  zoom, originPt, showLegend, pan, onPanChange, onZoomChange,
 }: {
   segments:         RoomSegment[];
   selectedId:       string | null;
@@ -421,6 +148,9 @@ function PerimeterCanvas({
   zoom:             number;
   originPt:         Point;
   showLegend:       boolean;
+  pan:              [number, number];
+  onPanChange:      (p: [number, number]) => void;
+  onZoomChange:     (z: number) => void;
 }) {
   const svgRef          = useRef<SVGSVGElement>(null);
   const lockRef         = useRef<CanvasTransform | null>(null);
@@ -431,6 +161,20 @@ function PerimeterCanvas({
   const lockBpRef       = useRef<{ segIdx: number; ptX: number; ptY: number } | null>(null);
   const lockCvRef       = useRef<{ segIdx: number; ptX: number; ptY: number } | null>(null);
   const snapTargetsRef  = useRef<SnapTarget[]>([]);
+
+  // ── Pan gesture (drag background) ────────────────────────────────────────
+  const panGestureRef   = useRef<{ startX: number; startY: number; px: number; py: number } | null>(null);
+  // ── Pinch gesture (two-finger zoom) ──────────────────────────────────────
+  const pinchGestureRef = useRef<{
+    dist: number; midSvgX: number; midSvgY: number;
+    startPanX: number; startPanY: number; startZoom: number;
+    baseOffX: number; baseOffY: number;
+  } | null>(null);
+  // Keep latest pan/zoom in refs so wheel/native handlers always read current values
+  const panRef  = useRef<[number, number]>(pan);
+  const zoomRef = useRef(zoom);
+  panRef.current  = pan;
+  zoomRef.current = zoom;
   const dragExcludeRef  = useRef<string>("");
   const [draggingVertex,     setDraggingVertex]     = useState<number | null>(null);
   const [draggingBreakpoint, setDraggingBreakpoint] = useState<number | null>(null);
@@ -521,6 +265,35 @@ function PerimeterCanvas({
     return () => { window.removeEventListener("pointermove", onMove); window.removeEventListener("pointerup", onUp); };
   }, [draggingAnchor]);
 
+  // ── Wheel zoom (desktop) ────────────────────────────────────────────────
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      const factor  = e.deltaY < 0 ? 1.12 : 0.88;
+      const z0      = zoomRef.current;
+      const newZoom = Math.max(0.15, Math.min(8, z0 * factor));
+      // Zoom around mouse cursor position in SVG coords
+      const rect    = svg!.getBoundingClientRect();
+      const msvgX   = e.clientX - rect.left;
+      const msvgY   = e.clientY - rect.top;
+      const baseXf  = computeTransform(segments, 1, originPt, CANVAS_W, CANVAS_H, CANVAS_PAD);
+      const eff0X   = (baseXf.offX - CANVAS_W / 2) * z0 + CANVAS_W / 2 + panRef.current[0];
+      const eff0Y   = (baseXf.offY - CANVAS_H / 2) * z0 + CANVAS_H / 2 + panRef.current[1];
+      const r       = newZoom / z0;
+      const newEffX = msvgX * (1 - r) + eff0X * r;
+      const newEffY = msvgY * (1 - r) + eff0Y * r;
+      const newPanX = newEffX - (baseXf.offX - CANVAS_W / 2) * newZoom - CANVAS_W / 2;
+      const newPanY = newEffY - (baseXf.offY - CANVAS_H / 2) * newZoom - CANVAS_H / 2;
+      onZoomChange(newZoom);
+      onPanChange([newPanX, newPanY]);
+    }
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments, originPt, onZoomChange, onPanChange]);
+
   if (segments.length === 0) {
     return (
       <div style={{
@@ -533,140 +306,150 @@ function PerimeterCanvas({
     );
   }
 
-  const xform  = lockRef.current ?? computeTransform(segments, zoom, originPt);
+  // ── Effective transform: base fit + zoom around canvas centre + pan ─────
+  function effectiveTransform(): CanvasTransform {
+    const base = computeTransform(segments, 1, originPt, CANVAS_W, CANVAS_H, CANVAS_PAD);
+    return {
+      scale: base.scale * zoom,
+      offX:  (base.offX - CANVAS_W / 2) * zoom + CANVAS_W / 2 + pan[0],
+      offY:  (base.offY - CANVAS_H / 2) * zoom + CANVAS_H / 2 + pan[1],
+      minX:  base.minX,
+      minY:  base.minY,
+    };
+  }
+
+  const xform  = lockRef.current ?? effectiveTransform();
   const { scale, offX, offY, minX, minY } = xform;
   const pts    = computePoints(segments, originPt);
   const closed = isClosed(segments, pts);
 
   // Keep snap targets fresh every render
   snapTargetsRef.current = buildSnapTargets(segments, pts);
-  const openings = computeOpenings(segments, pts);
 
   const tx = (x: number) => offX + (x - minX) * scale;
   const ty = (y: number) => offY + (y - minY) * scale;
 
-  const signedArea = (() => {
-    const n = pts.length - 1;
-    let s = 0;
-    for (let i = 0; i < n; i++) s += pts[i][0] * pts[i + 1][1] - pts[i + 1][0] * pts[i][1];
-    return s;
-  })();
-  const normalSign = signedArea >= 0 ? 1 : -1;
-
-  /**
-   * Map (alongIn, depthIn) → SVG canvas coords.
-   * Handles straight, breakpoint, and bezier-curved segments.
-   */
-  function wallPt(segIdx: number, alongIn: number, depthIn: number): [number, number] {
-    const [wx1, wy1] = segStart(segments, pts, segIdx);
-    if (segIdx + 1 >= pts.length) return [tx(wx1), ty(wy1)];
-    const [wx2, wy2] = pts[segIdx + 1];
-    const seg = segments[segIdx];
-
-    // Bezier curve
-    if (seg.cpDxIn !== undefined && seg.cpDyIn !== undefined) {
-      const p0: Point = [wx1, wy1];
-      const p1: Point = [wx1 + seg.cpDxIn, wy1 + seg.cpDyIn];
-      const p2: Point = [wx2, wy2];
-      const table = bezierArcTable(p0, p1, p2);
-      const t     = arcLengthToT(table, alongIn);
-      const [bx, by]   = qBez(t, p0, p1, p2);
-      const [tdx, tdy] = qBezTan(t, p0, p1, p2);
-      const tlen = Math.sqrt(tdx * tdx + tdy * tdy) || 1;
-      const nx = -tdy / tlen * normalSign, ny = tdx / tlen * normalSign;
-      return [tx(bx + nx * depthIn), ty(by + ny * depthIn)];
-    }
-
-    // Breakpoint (two straight sub-legs)
-    if (seg.breakDxIn !== undefined && seg.breakDyIn !== undefined) {
-      const bx = wx1 + seg.breakDxIn, by = wy1 + seg.breakDyIn;
-      const leg1Len = Math.sqrt(seg.breakDxIn ** 2 + seg.breakDyIn ** 2);
-      const leg2dx  = wx2 - bx, leg2dy = wy2 - by;
-      const leg2Len = Math.sqrt(leg2dx ** 2 + leg2dy ** 2);
-      if (leg1Len > 0.01 && alongIn <= leg1Len) {
-        const ux = seg.breakDxIn / leg1Len, uy = seg.breakDyIn / leg1Len;
-        const nx = -uy * normalSign, ny = ux * normalSign;
-        return [tx(wx1 + ux * alongIn + nx * depthIn), ty(wy1 + uy * alongIn + ny * depthIn)];
-      }
-      const rem = alongIn - leg1Len;
-      if (leg2Len < 0.01) return [tx(bx), ty(by)];
-      const ux = leg2dx / leg2Len, uy = leg2dy / leg2Len;
-      const nx = -uy * normalSign, ny = ux * normalSign;
-      return [tx(bx + ux * rem + nx * depthIn), ty(by + uy * rem + ny * depthIn)];
-    }
-
-    // Straight
-    const wlen = Math.sqrt((wx2 - wx1) ** 2 + (wy2 - wy1) ** 2);
-    if (wlen < 0.01) return [tx(wx1), ty(wy1)];
-    const ux = (wx2 - wx1) / wlen, uy = (wy2 - wy1) / wlen;
-    const nx = -uy * normalSign, ny = ux * normalSign;
-    return [tx(wx1 + ux * alongIn + nx * depthIn), ty(wy1 + uy * alongIn + ny * depthIn)];
-  }
+  const normalSign = computeSignedArea(segments, pts) >= 0 ? 1 : -1;
+  const wallPt     = makeWallPtFn(segments, pts, normalSign, tx, ty);
 
   function ptStr(...coords: [number, number][]): string {
     return coords.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
   }
 
-  /** Build SVG path data for the room perimeter, respecting curves and breakpoints. */
-  function buildRoomPath(): string {
-    if (pts.length < 2) return "";
-    const [s0x, s0y] = segStart(segments, pts, 0);
-    let d = `M ${tx(s0x).toFixed(1)} ${ty(s0y).toFixed(1)}`;
-    for (let i = 0; i < segments.length && i + 1 < pts.length; i++) {
-      const seg = segments[i];
-      const [sx, sy] = segStart(segments, pts, i);
-      const [ex, ey] = pts[i + 1];
-      // Anchored segment breaks the chain — moveto its start before drawing
-      if (i > 0 && seg.anchorX !== undefined) {
-        d += ` M ${tx(sx).toFixed(1)} ${ty(sy).toFixed(1)}`;
-      }
-      if (seg.cpDxIn !== undefined && seg.cpDyIn !== undefined) {
-        const cpx = tx(sx + seg.cpDxIn), cpy = ty(sy + seg.cpDyIn);
-        d += ` Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-      } else if (seg.breakDxIn !== undefined && seg.breakDyIn !== undefined) {
-        const bx = tx(sx + seg.breakDxIn), by = ty(sy + seg.breakDyIn);
-        d += ` L ${bx.toFixed(1)} ${by.toFixed(1)} L ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-      } else {
-        d += ` L ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-      }
+  // ── Pinch helpers ────────────────────────────────────────────────────────
+  const isPointDragging = draggingVertex !== null || draggingBreakpoint !== null || draggingCurve !== null || draggingAnchor !== null;
+
+  function handleBgPointerDown(e: React.PointerEvent) {
+    if (isPointDragging) return;
+    e.preventDefault();
+    e.stopPropagation();
+    (e.currentTarget as SVGRectElement).setPointerCapture(e.pointerId);
+    panGestureRef.current = { startX: e.clientX, startY: e.clientY, px: pan[0], py: pan[1] };
+    pinchGestureRef.current = null;
+  }
+
+  function handleBgPointerMove(e: React.PointerEvent) {
+    const pg = panGestureRef.current;
+    if (!pg) return;
+    const dx = e.clientX - pg.startX;
+    const dy = e.clientY - pg.startY;
+    onPanChange([pg.px + dx, pg.py + dy]);
+  }
+
+  function handleBgPointerUp() {
+    panGestureRef.current = null;
+  }
+
+  function handleTouchStart(e: React.TouchEvent) {
+    if (isPointDragging) return;
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      panGestureRef.current = null;
+      const t1 = e.touches[0], t2 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+      const rect = svgRef.current!.getBoundingClientRect();
+      const midSvgX = (t1.clientX + t2.clientX) / 2 - rect.left;
+      const midSvgY = (t1.clientY + t2.clientY) / 2 - rect.top;
+      const base = computeTransform(segments, 1, originPt, CANVAS_W, CANVAS_H, CANVAS_PAD);
+      pinchGestureRef.current = {
+        dist, midSvgX, midSvgY,
+        startPanX: pan[0], startPanY: pan[1], startZoom: zoom,
+        baseOffX: base.offX, baseOffY: base.offY,
+      };
     }
-    if (closed) d += " Z";
-    return d;
+  }
+
+  function handleTouchMove(e: React.TouchEvent) {
+    const pg = pinchGestureRef.current;
+    if (!pg || e.touches.length !== 2) return;
+    e.preventDefault();
+    const t1 = e.touches[0], t2 = e.touches[1];
+    const newDist = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+    const ratio   = newDist / pg.dist;
+    const newZoom = Math.max(0.15, Math.min(8, pg.startZoom * ratio));
+    // Keep pinch centre fixed in SVG space
+    const eff0X   = (pg.baseOffX - CANVAS_W / 2) * pg.startZoom + CANVAS_W / 2 + pg.startPanX;
+    const eff0Y   = (pg.baseOffY - CANVAS_H / 2) * pg.startZoom + CANVAS_H / 2 + pg.startPanY;
+    const zr      = newZoom / pg.startZoom;
+    const newEffX = pg.midSvgX * (1 - zr) + eff0X * zr;
+    const newEffY = pg.midSvgY * (1 - zr) + eff0Y * zr;
+    const newPanX = newEffX - (pg.baseOffX - CANVAS_W / 2) * newZoom - CANVAS_W / 2;
+    const newPanY = newEffY - (pg.baseOffY - CANVAS_H / 2) * newZoom - CANVAS_H / 2;
+    onZoomChange(newZoom);
+    onPanChange([newPanX, newPanY]);
+  }
+
+  function handleTouchEnd(e: React.TouchEvent) {
+    if (e.touches.length < 2) pinchGestureRef.current = null;
   }
 
   return (
     <svg ref={svgRef} width={CANVAS_W} height={CANVAS_H}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
       style={{
         display: "block", backgroundColor: "#fafaf8",
         borderRadius: "8px", border: "1px solid #e8e4de",
-        cursor: (draggingVertex !== null || draggingBreakpoint !== null || draggingCurve !== null) ? "grabbing" : "default",
+        cursor: isPointDragging ? "grabbing" : panGestureRef.current ? "grabbing" : "default",
         userSelect: "none", touchAction: "none",
       }}>
 
+      {/* Background — captures pointer for pan (fires only when handles don't stop propagation) */}
+      <rect x={0} y={0} width={CANVAS_W} height={CANVAS_H} fill="transparent"
+        style={{ cursor: isPointDragging ? "default" : "grab" }}
+        onPointerDown={handleBgPointerDown}
+        onPointerMove={handleBgPointerMove}
+        onPointerUp={handleBgPointerUp}
+        onPointerCancel={handleBgPointerUp}
+      />
+
       {/* Room fill — uses path to support curves */}
       {closed && (
-        <path d={buildRoomPath()} fill="rgba(22,163,74,0.04)" />
+        <path d={buildRoomPath(segments, pts, closed, tx, ty)} fill="rgba(22,163,74,0.04)" />
       )}
 
       {/* Closet footprints */}
       {designRuns.map(run => {
         const segIdx = segments.findIndex(s => s.id === run.wallId);
         if (segIdx === -1 || segIdx + 1 >= pts.length || run.sections.length === 0) return null;
+        // fd: flip depth sign if footprintFlipped is set on this wall
+        const fd = (d: number) => segments[segIdx].footprintFlipped ? -d : d;
         return (
           <g key={run.wallId} pointerEvents="none">
             {run.sections.map((sec, si) => {
               const leftIn  = si === 0 ? run.startIn : run.panels[si - 1].xIn + TV_PANEL_W;
               const rightIn = si === run.panels.length ? run.endIn : run.panels[si].xIn;
               if (rightIn <= leftIn) return null;
-              const a = wallPt(segIdx, leftIn, 0);   const b = wallPt(segIdx, rightIn, 0);
-              const c = wallPt(segIdx, rightIn, sec.depthIn); const d = wallPt(segIdx, leftIn, sec.depthIn);
+              const a = wallPt(segIdx, leftIn, 0);             const b = wallPt(segIdx, rightIn, 0);
+              const c = wallPt(segIdx, rightIn, fd(sec.depthIn)); const d = wallPt(segIdx, leftIn, fd(sec.depthIn));
               return <polygon key={sec.id} points={ptStr(a,b,c,d)} fill="rgba(195,155,100,0.28)" stroke="#c4935a" strokeWidth={0.75} />;
             })}
             {run.panels.map((panel, pi) => {
               const lD = run.sections[pi]?.depthIn ?? 12, rD = run.sections[pi+1]?.depthIn ?? 12;
               const maxD = Math.max(lD, rD);
-              const a = wallPt(segIdx, panel.xIn, 0); const b = wallPt(segIdx, panel.xIn + TV_PANEL_W, 0);
-              const c = wallPt(segIdx, panel.xIn + TV_PANEL_W, maxD); const d = wallPt(segIdx, panel.xIn, maxD);
+              const a = wallPt(segIdx, panel.xIn, 0);                   const b = wallPt(segIdx, panel.xIn + TV_PANEL_W, 0);
+              const c = wallPt(segIdx, panel.xIn + TV_PANEL_W, fd(maxD)); const d = wallPt(segIdx, panel.xIn, fd(maxD));
               return <polygon key={panel.id} points={ptStr(a,b,c,d)} fill="#b8956a" stroke="#8b6437" strokeWidth={0.5} />;
             })}
             {(() => {
@@ -674,53 +457,17 @@ function PerimeterCanvas({
               const dN = run.sections[run.sections.length - 1]?.depthIn ?? 12;
               const la = wallPt(segIdx, run.startIn, 0);
               const lb = wallPt(segIdx, run.startIn + TV_PANEL_W, 0);
-              const lc = wallPt(segIdx, run.startIn + TV_PANEL_W, d0);
-              const ld = wallPt(segIdx, run.startIn, d0);
+              const lc = wallPt(segIdx, run.startIn + TV_PANEL_W, fd(d0));
+              const ld = wallPt(segIdx, run.startIn, fd(d0));
               const ra = wallPt(segIdx, run.endIn - TV_PANEL_W, 0);
               const rb = wallPt(segIdx, run.endIn, 0);
-              const rc = wallPt(segIdx, run.endIn, dN);
-              const rd = wallPt(segIdx, run.endIn - TV_PANEL_W, dN);
+              const rc = wallPt(segIdx, run.endIn, fd(dN));
+              const rd = wallPt(segIdx, run.endIn - TV_PANEL_W, fd(dN));
               return <>
                 <polygon points={ptStr(la,lb,lc,ld)} fill="#b8956a" stroke="#8b6437" strokeWidth={0.75} />
                 <polygon points={ptStr(ra,rb,rc,rd)} fill="#b8956a" stroke="#8b6437" strokeWidth={0.75} />
               </>;
             })()}
-          </g>
-        );
-      })}
-
-      {/* Opening indicators — one per gap between disconnected endpoints */}
-      {openings.map((op, oi) => {
-        const sx1 = tx(op.pt1[0]), sy1 = ty(op.pt1[1]);
-        const sx2 = tx(op.pt2[0]), sy2 = ty(op.pt2[1]);
-        const dx = sx2 - sx1, dy = sy2 - sy1;
-        const lenPx = Math.sqrt(dx * dx + dy * dy) || 1;
-        const ux = dx / lenPx, uy = dy / lenPx;
-        const nx = -uy * normalSign, ny = ux * normalSign;
-        const midX = (sx1 + sx2) / 2, midY = (sy1 + sy2) / 2;
-        const lx = midX + nx * 22, ly = midY + ny * 22;
-        const arrowLen = Math.min(12, lenPx * 0.15);
-        const wIn = Math.round(op.widthIn);
-        return (
-          <g key={oi} pointerEvents="none">
-            <line x1={sx1} y1={sy1} x2={sx2} y2={sy2}
-              stroke="#2563eb" strokeWidth={2} strokeDasharray="7 4" opacity={0.55} />
-            <line x1={sx1 - ny * 6} y1={sy1 + nx * 6} x2={sx1 + ny * 6} y2={sy1 - nx * 6}
-              stroke="#2563eb" strokeWidth={2} opacity={0.7} />
-            <line x1={sx2 - ny * 6} y1={sy2 + nx * 6} x2={sx2 + ny * 6} y2={sy2 - nx * 6}
-              stroke="#2563eb" strokeWidth={2} opacity={0.7} />
-            {lenPx > 30 && <>
-              <line x1={midX} y1={midY} x2={midX - ux * arrowLen} y2={midY - uy * arrowLen}
-                stroke="#2563eb" strokeWidth={1.5} opacity={0.65} />
-              <line x1={midX} y1={midY} x2={midX + ux * arrowLen} y2={midY + uy * arrowLen}
-                stroke="#2563eb" strokeWidth={1.5} opacity={0.65} />
-            </>}
-            <rect x={lx - 34} y={ly - 9} width={68} height={16} rx={4}
-              fill="rgba(239,246,255,0.92)" stroke="#93c5fd" strokeWidth={0.75} />
-            <text x={lx} y={ly + 4} textAnchor="middle" fontSize={9}
-              fill="#1d4ed8" fontWeight="800">
-              Opening {openings.length > 1 ? `${oi + 1}: ` : ""}{wIn}&quot;
-            </text>
           </g>
         );
       })}
@@ -781,32 +528,30 @@ function PerimeterCanvas({
         );
       })}
 
-      {/* Draggable vertex handles */}
+      {/* Draggable vertex handles — uniform blue circles for all geometry points */}
       {pts.map(([x, y], i) => {
         if (closed && i === pts.length - 1) return null;
-        // Hide vertex 0 (origin) when the first segment is free-standing (has anchor)
-        if (i === 0 && segments.length > 0 && segments[0].anchorX !== undefined) return null;
+        // pts[0] = origin; skip it when the first segment is free-standing (anchored),
+        // since the origin has no geometry attached to it and would appear as a stray dot.
+        if (i === 0 && segments[0]?.anchorX !== undefined) return null;
         const isDragging = i === draggingVertex;
-        const fill       = isDragging ? "#2563eb" : "#4a90d9";
-        const handler    = (e: React.PointerEvent) => {
-          e.preventDefault(); e.stopPropagation();
-          dragExcludeRef.current = `v:${i}`;
-          lockRef.current = computeTransform(segments, zoom, originPt);
-          setDraggingVertex(i);
-        };
         return (
           <g key={`v${i}`} style={{ cursor: isDragging ? "grabbing" : "grab" }}
-            onPointerDown={handler}>
-            {/* Invisible oversized hit target for easy touch */}
+            onPointerDown={(e: React.PointerEvent) => {
+              e.preventDefault(); e.stopPropagation();
+              dragExcludeRef.current = `v:${i}`;
+              lockRef.current = effectiveTransform();
+              setDraggingVertex(i);
+            }}>
             <circle cx={tx(x)} cy={ty(y)} r={20} fill="transparent" stroke="none" />
-            {/* Visible handle */}
             <circle cx={tx(x)} cy={ty(y)} r={7}
-              fill={fill} stroke="#fff" strokeWidth={1.5} pointerEvents="none" />
+              fill={isDragging ? "#2563eb" : "#4a90d9"}
+              stroke="#fff" strokeWidth={1.5} pointerEvents="none" />
           </g>
         );
       })}
 
-      {/* Anchor handles — orange circles for free-standing segments */}
+      {/* Anchor handles — same blue circles, drag behavior moves whole segment */}
       {segments.map((seg, i) => {
         if (seg.anchorX === undefined || seg.anchorY === undefined) return null;
         const ax = tx(seg.anchorX), ay = ty(seg.anchorY);
@@ -817,20 +562,18 @@ function PerimeterCanvas({
             onPointerDown={(e) => {
               e.preventDefault(); e.stopPropagation();
               dragExcludeRef.current = `a:${seg.id}`;
-              lockRef.current = computeTransform(segments, zoom, originPt);
+              lockRef.current = effectiveTransform();
               setDraggingAnchor(i);
             }}>
-            {/* Invisible oversized hit target */}
             <circle cx={ax} cy={ay} r={20} fill="transparent" stroke="none" />
-            {/* Visible handle — orange to distinguish from regular vertices */}
             <circle cx={ax} cy={ay} r={7}
-              fill={isDragging ? "#ea580c" : "#f97316"}
+              fill={isDragging ? "#2563eb" : "#4a90d9"}
               stroke="#fff" strokeWidth={1.5} pointerEvents="none" />
           </g>
         );
       })}
 
-      {/* Breakpoint handles — amber diamonds */}
+      {/* Breakpoint handles — blue circles (same as vertices) */}
       {segments.map((seg, i) => {
         if (!segHasBreakpoint(seg) || i + 1 >= pts.length) return null;
         const [wx1, wy1] = segStart(segments, pts, i);
@@ -842,16 +585,14 @@ function PerimeterCanvas({
             onPointerDown={(e) => {
               e.preventDefault(); e.stopPropagation();
               dragExcludeRef.current = "";
-              lockRef.current = computeTransform(segments, zoom, originPt);
+              lockRef.current = effectiveTransform();
               lockBpRef.current = { segIdx: i, ptX: wx1, ptY: wy1 };
               setDraggingBreakpoint(i);
             }}>
-            <rect x={bx - 18} y={by - 18} width={36} height={36} fill="transparent" />
-            <rect x={bx - 5} y={by - 5} width={10} height={10}
-              fill={isDragging ? "#d97706" : "#f59e0b"}
-              stroke="#fff" strokeWidth={1.5}
-              transform={`rotate(45 ${bx} ${by})`}
-            />
+            <circle cx={bx} cy={by} r={20} fill="transparent" stroke="none" />
+            <circle cx={bx} cy={by} r={7}
+              fill={isDragging ? "#2563eb" : "#4a90d9"}
+              stroke="#fff" strokeWidth={1.5} pointerEvents="none" />
           </g>
         );
       })}
@@ -877,7 +618,7 @@ function PerimeterCanvas({
               onPointerDown={(e) => {
                 e.preventDefault(); e.stopPropagation();
                 dragExcludeRef.current = "";
-                lockRef.current = computeTransform(segments, zoom, originPt);
+                lockRef.current = effectiveTransform();
                 lockCvRef.current = { segIdx: i, ptX: wx1, ptY: wy1 };
                 setDraggingCurve(i);
               }}
@@ -904,37 +645,28 @@ function PerimeterCanvas({
       {/* Legend */}
       {showLegend && (
         <g pointerEvents="none">
-          <rect x={8} y={CANVAS_H - 122} width={148} height={115} rx={4}
+          <rect x={8} y={CANVAS_H - 88} width={148} height={80} rx={4}
             fill="rgba(250,250,248,0.92)" stroke="#e8e4de" strokeWidth={0.75} />
-          <line x1={14} y1={CANVAS_H - 98} x2={26} y2={CANVAS_H - 98}
+          <line x1={14} y1={CANVAS_H - 64} x2={26} y2={CANVAS_H - 64}
             stroke="#15803d" strokeWidth={3} strokeLinecap="round" />
-          <text x={30} y={CANVAS_H - 94} fontSize={8} fill="#777">Has closet</text>
-          <line x1={14} y1={CANVAS_H - 84} x2={26} y2={CANVAS_H - 84}
+          <text x={30} y={CANVAS_H - 60} fontSize={8} fill="#777">Has closet</text>
+          <line x1={14} y1={CANVAS_H - 50} x2={26} y2={CANVAS_H - 50}
             stroke="#94a3b8" strokeWidth={2} strokeLinecap="round" />
-          <text x={30} y={CANVAS_H - 80} fontSize={8} fill="#777">No closet</text>
-          <circle cx={17} cy={CANVAS_H - 68} r={5} fill="#4a90d9" stroke="#fff" strokeWidth={1.5} />
-          <text x={30} y={CANVAS_H - 64} fontSize={8} fill="#777">Vertex (drag to reshape)</text>
-          <circle cx={17} cy={CANVAS_H - 55} r={5} fill="#f97316" stroke="#fff" strokeWidth={1.5} />
-          <text x={30} y={CANVAS_H - 51} fontSize={8} fill="#777">Anchor (drag free wall)</text>
-          <rect x={12} y={CANVAS_H - 47} width={10} height={10}
-            fill="#f59e0b" stroke="#fff" strokeWidth={1.5}
-            transform={`rotate(45 17 ${CANVAS_H - 42})`} />
-          <text x={30} y={CANVAS_H - 38} fontSize={8} fill="#777">Breakpoint (drag kink)</text>
-          <circle cx={17} cy={CANVAS_H - 27} r={5} fill="#06b6d4" stroke="#fff" strokeWidth={1.5} />
-          <text x={30} y={CANVAS_H - 23} fontSize={8} fill="#777">Curve control (drag arc)</text>
-          <rect x={13} y={CANVAS_H - 12} width={8} height={6} rx={1}
+          <text x={30} y={CANVAS_H - 46} fontSize={8} fill="#777">No closet</text>
+          <circle cx={17} cy={CANVAS_H - 34} r={5} fill="#4a90d9" stroke="#fff" strokeWidth={1.5} />
+          <text x={30} y={CANVAS_H - 30} fontSize={8} fill="#777">Point (drag to reshape)</text>
+          <circle cx={17} cy={CANVAS_H - 20} r={5} fill="#06b6d4" stroke="#fff" strokeWidth={1.5} />
+          <text x={30} y={CANVAS_H - 16} fontSize={8} fill="#777">Curve control (drag arc)</text>
+          <rect x={13} y={CANVAS_H - 10} width={8} height={6} rx={1}
             fill="rgba(195,155,100,0.45)" stroke="#c4935a" strokeWidth={0.75} />
-          <text x={30} y={CANVAS_H - 6} fontSize={8} fill="#777">Closet footprint</text>
+          <text x={30} y={CANVAS_H - 4} fontSize={8} fill="#777">Closet footprint</text>
         </g>
       )}
 
       {/* Open/closed status */}
       <text x={CANVAS_W - 8} y={CANVAS_H - 8} textAnchor="end" fontSize={9} fontWeight="700"
         fill={closed ? "#15803d" : "#2563eb"} pointerEvents="none">
-        {closed ? "✓ Closed room" : openings.length === 0 ? "○ Open" :
-          openings.length === 1
-            ? `↔ Opening: ${Math.round(openings[0].widthIn)}"`
-            : `↔ ${openings.length} openings`}
+        {closed ? "✓ Closed room" : "○ Open"}
       </text>
     </svg>
   );
@@ -996,12 +728,6 @@ function SegmentRow({
             <span style={{ fontSize: "9px", color: "#0e7490", backgroundColor: "#ecfeff",
               padding: "1px 4px", borderRadius: "3px", fontWeight: "600" }}>
               curve
-            </span>
-          )}
-          {seg.anchorX !== undefined && (
-            <span style={{ fontSize: "9px", color: "#c2410c", backgroundColor: "#fff7ed",
-              padding: "1px 4px", borderRadius: "3px", fontWeight: "600" }}>
-              free
             </span>
           )}
         </div>
@@ -1100,6 +826,30 @@ function SegmentEditor({
           </div>
         </div>
       </div>
+
+      {/* Closet footprint direction — only relevant when Has Closet is on */}
+      {hasClos && (
+        <div>
+          <label style={ES.lbl}>Closet Footprint Side</label>
+          <div style={{ display: "flex", gap: "8px" }}>
+            <button
+              onClick={() => onChange({ ...seg, footprintFlipped: false })}
+              style={{ ...ES.tog(!seg.footprintFlipped, "#15803d"), flex: 1, fontSize: "11px" }}>
+              ↗ Auto (inward)
+            </button>
+            <button
+              onClick={() => onChange({ ...seg, footprintFlipped: true })}
+              style={{ ...ES.tog(!!seg.footprintFlipped, "#b91c1c"), flex: 1, fontSize: "11px" }}>
+              ↙ Flip (outward)
+            </button>
+          </div>
+          {seg.footprintFlipped && (
+            <div style={{ fontSize: "10px", color: "#b91c1c", marginTop: "4px" }}>
+              Footprint direction is manually flipped for this wall.
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Label + Length */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 90px", gap: "10px" }}>
@@ -1259,42 +1009,6 @@ function SegmentEditor({
         </div>
       </div>
 
-      {/* Free-standing / chain connection */}
-      <div>
-        <label style={ES.lbl}>Positioning</label>
-        <div style={{ display: "flex", gap: "8px" }}>
-          <button
-            onClick={() => {
-              // Remove anchor → reconnect to chain
-              onChange({ ...seg, anchorX: undefined, anchorY: undefined });
-            }}
-            style={{
-              ...ES.tog(seg.anchorX === undefined, "#15803d"),
-              flex: 1, padding: "8px 10px", fontSize: "11px",
-            }}>
-            ⛓ Connected to chain
-          </button>
-          <button
-            onClick={() => {
-              // Set anchor at current position (compute from chain or keep existing)
-              const ax = seg.anchorX ?? 0;
-              const ay = seg.anchorY ?? 0;
-              onChange({ ...seg, anchorX: ax, anchorY: ay });
-            }}
-            style={{
-              ...ES.tog(seg.anchorX !== undefined, "#f97316"),
-              flex: 1, padding: "8px 10px", fontSize: "11px",
-            }}>
-            ✦ Free-standing
-          </button>
-        </div>
-        {seg.anchorX !== undefined && (
-          <div style={{ fontSize: "10px", color: "#888", marginTop: "5px" }}>
-            Drag the orange ● handle on the canvas to reposition this wall.
-          </div>
-        )}
-      </div>
-
       {/* Notes */}
       <div>
         <label style={ES.lbl}>Notes</label>
@@ -1402,6 +1116,7 @@ export default function RoomLayoutPage() {
   const [designRuns,   setDesignRuns]   = useState<TopViewRun[]>([]);
   const [ready,        setReady]        = useState(false);
   const [roomZoom,     setRoomZoom]     = useState(1.0);
+  const [viewPan,      setViewPan]      = useState<[number, number]>([0, 0]);
   const [originPt,     setOriginPt]     = useState<Point>([0, 0]);
   const [showLegend,   setShowLegend]   = useState(true);
 
@@ -1880,8 +1595,8 @@ export default function RoomLayoutPage() {
                   title="Zoom in"
                   style={ZS.btn}>+</button>
                 <button
-                  onClick={() => setRoomZoom(1)}
-                  title="Reset zoom"
+                  onClick={() => { setRoomZoom(1); setViewPan([0, 0]); }}
+                  title="Reset zoom and pan"
                   style={ZS.reset}>Reset</button>
                 <button
                   onClick={() => setShowLegend(v => !v)}
@@ -1904,6 +1619,9 @@ export default function RoomLayoutPage() {
                 zoom={roomZoom}
                 originPt={originPt}
                 showLegend={showLegend}
+                pan={viewPan}
+                onPanChange={setViewPan}
+                onZoomChange={z => setRoomZoom(Math.max(0.15, Math.min(8, z)))}
               />
             </div>
             {designRuns.length > 0 && (

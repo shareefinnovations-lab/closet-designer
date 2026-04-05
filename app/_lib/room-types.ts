@@ -26,6 +26,9 @@ export interface RoomSegment {
   // Dragging the anchor handle moves the whole segment without changing its length/angle.
   anchorX?:          number;
   anchorY?:          number;
+  // Footprint direction override — when true, the closet footprint projects to the
+  // opposite side of the wall from the automatic inward direction.
+  footprintFlipped?: boolean;
   usable:            boolean;           // physical: can cabinetry go here at all?
   selectedForDesign: boolean;           // user choice: "Has Closet" — include in design
   canHaveCabinetry:  boolean;
