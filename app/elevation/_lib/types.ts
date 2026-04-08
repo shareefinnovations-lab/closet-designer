@@ -19,14 +19,15 @@ export interface Section {
 }
 
 export interface Config {
-  clientName:      string;
-  clientNum:       string;
-  locationName:    string;
-  wallWidthIn:     number;
-  ceilingHeightIn: number;
-  closetDepthIn:   number;
-  leftReturnIn:    number;
-  rightReturnIn:   number;
-  remarks:         string;
-  projectType?:    string;  // set from dashboard: Reach-In Closet, Walk-In Closet, Garage, etc.
+  clientName:       string;
+  clientNum:        string;
+  locationName:     string;
+  // Dimension fields are optional — room geometry is now set in Room Layout, not Setup
+  wallWidthIn?:     number;
+  ceilingHeightIn?: number;
+  closetDepthIn?:   number;
+  leftReturnIn?:    number;
+  rightReturnIn?:   number;
+  remarks:          string;
+  projectType?:     string;  // set from dashboard: Reach-In Closet, Walk-In Closet, Garage, etc.
 }

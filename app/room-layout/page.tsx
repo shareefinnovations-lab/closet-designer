@@ -8,6 +8,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
+import { getActiveProjectId, saveCurrentProject } from "@/app/_lib/projects";
 import type { RoomLayout, RoomSegment, SegmentDirection } from "@/app/_lib/room-types";
 import type { Config } from "@/app/elevation/_lib/types";
 import {
@@ -467,6 +468,37 @@ function PerimeterCanvas({
                 <polygon points={ptStr(la,lb,lc,ld)} fill="#b8956a" stroke="#8b6437" strokeWidth={0.75} />
                 <polygon points={ptStr(ra,rb,rc,rd)} fill="#b8956a" stroke="#8b6437" strokeWidth={0.75} />
               </>;
+            })()}
+            {(() => {
+              const [wx1, wy1] = segStart(segments, pts, segIdx);
+              const [wx2, wy2] = pts[segIdx + 1] ?? pts[segIdx];
+              const wl = Math.sqrt((wx2 - wx1) ** 2 + (wy2 - wy1) ** 2);
+              if (wl < 0.01) return null;
+              const depthAngle = (Math.atan2((wy2 - wy1) / wl, (wx2 - wx1) / wl) * 180 / Math.PI) - 90;
+              const d0 = run.sections[0]?.depthIn ?? 12;
+              const dN = run.sections[run.sections.length - 1]?.depthIn ?? 12;
+              type PD = { mid: number; depth: number; key: string };
+              const items: PD[] = [];
+              items.push({ mid: run.startIn + TV_PANEL_W / 2, depth: d0, key: 'lep' });
+              run.panels.forEach((panel, pi) => {
+                const lD = run.sections[pi]?.depthIn ?? 12;
+                const rD = run.sections[pi + 1]?.depthIn ?? 12;
+                items.push({ mid: panel.xIn + TV_PANEL_W / 2, depth: Math.max(lD, rD), key: `ip${panel.id}` });
+              });
+              items.push({ mid: run.endIn - TV_PANEL_W / 2, depth: dN, key: 'rep' });
+              return items.map(({ mid, depth, key }) => {
+                const [mx, my] = wallPt(segIdx, mid, fd(depth / 2));
+                return (
+                  <text key={`pdlbl-${key}`}
+                    x={mx} y={my}
+                    textAnchor="middle" dominantBaseline="central"
+                    fontSize={10} fill="#000" fontWeight="900" pointerEvents="none"
+                    stroke="#fff" strokeWidth={2.5} paintOrder="stroke"
+                    transform={`rotate(${depthAngle.toFixed(1)},${mx.toFixed(1)},${my.toFixed(1)})`}>
+                    {depth}"
+                  </text>
+                );
+              });
             })()}
           </g>
         );
@@ -1128,15 +1160,12 @@ export default function RoomLayoutPage() {
 
     try {
       const cfg = JSON.parse(rawSetup) as Config;
-      setProjectType(cfg.projectType  ?? "");
-      setClientName(cfg.clientName    ?? "");
-      setClientNum(cfg.clientNum      ?? "");
+      setProjectType(cfg.projectType   ?? "");
+      setClientName(cfg.clientName     ?? "");
+      setClientNum(cfg.clientNum       ?? "");
       setLocationName(cfg.locationName ?? "");
-      setRemarks(cfg.remarks          ?? "");
-      setCeilingH(cfg.ceilingHeightIn ?? 101);
-      const sh = (cfg.ceilingHeightIn ?? 101) >= 96 ? 84 : Math.max(60, (cfg.ceilingHeightIn ?? 101) - 12);
-      setSystemH(sh);
-      setDepthIn(cfg.closetDepthIn ?? 25);
+      setRemarks(cfg.remarks           ?? "");
+      // Dimensions now default here — no longer sourced from setup
 
       const rawLayout = localStorage.getItem("room-layout");
       if (rawLayout) {
@@ -1157,6 +1186,7 @@ export default function RoomLayoutPage() {
               setOriginPt([saved.originX, saved.originY]);
             }
           } else if ((saved.walls ?? []).length > 0) {
+            // Legacy v1 wall migration
             const migrated: RoomSegment[] = (saved.walls ?? []).map(w => ({
               id: nextId(), label: w.label || w.id,
               lengthIn: w.widthIn, direction: "right" as SegmentDirection,
@@ -1166,24 +1196,11 @@ export default function RoomLayoutPage() {
             }));
             setSegments(migrated);
             setSelectedId(migrated[0]?.id ?? null);
-          } else {
-            const w = cfg.wallWidthIn ?? 120, d = cfg.closetDepthIn ?? 84;
-            const def = makeDefault(w, d);
-            setSegments(def);
-            setSelectedId(def[0]?.id ?? null);
           }
-        } catch {
-          const w = cfg.wallWidthIn ?? 120, d = cfg.closetDepthIn ?? 84;
-          const def = makeDefault(w, d);
-          setSegments(def);
-          setSelectedId(def[0]?.id ?? null);
-        }
-      } else {
-        const w = cfg.wallWidthIn ?? 120, d = cfg.closetDepthIn ?? 84;
-        const def = makeDefault(w, d);
-        setSegments(def);
-        setSelectedId(def[0]?.id ?? null);
+          // else: saved layout has no segments → start blank (fall through)
+        } catch { /* corrupt saved layout → start blank */ }
       }
+      // No saved layout → segments stay [] (blank room, user builds from scratch)
 
       // Load design runs for overlay
       const rawDesign = localStorage.getItem("design-state");
@@ -1409,7 +1426,7 @@ export default function RoomLayoutPage() {
           )}
           {clientName && <span style={{ fontSize: "12px", color: "#888" }}>{clientName}</span>}
         </div>
-        <div style={{ display: "flex", gap: "6px" }}>
+        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
           {["Setup", "Room Layout", "Design", "Pricing"].map((s, i) => (
             <span key={s} style={{
               fontSize: "11px", padding: "3px 10px", borderRadius: "20px",
@@ -1418,6 +1435,18 @@ export default function RoomLayoutPage() {
               fontWeight: i === 1 ? "700" : "400",
             }}>{s}</span>
           ))}
+          <button onClick={() => { saveCurrentProject(getActiveProjectId()); }}
+            style={{ fontSize: "12px", fontWeight: "700", cursor: "pointer", marginLeft: "8px",
+              padding: "5px 14px", borderRadius: "6px", border: "none",
+              backgroundColor: "#3a5a3a", color: "#fff" }}>
+            Save
+          </button>
+          <button onClick={() => router.push("/")}
+            style={{ fontSize: "12px", fontWeight: "600", cursor: "pointer",
+              padding: "5px 14px", borderRadius: "6px",
+              border: "1.5px solid #4a4a4a", backgroundColor: "transparent", color: "#aaa" }}>
+            Dashboard
+          </button>
         </div>
       </header>
 

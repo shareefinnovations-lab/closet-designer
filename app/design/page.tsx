@@ -9,10 +9,14 @@ import {
   type Point, computePoints, segStart, isClosed,
   computeTransform, computeSignedArea, makeWallPtFn, buildRoomPath,
 } from "@/app/_lib/room-geo";
+import {
+  getActiveProjectId, getProject, saveCurrentProject, projectDisplayName,
+  type Project,
+} from "@/app/_lib/projects";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type CompType = "Shelf" | "Rod" | "DrawerStack";
+type CompType = "Shelf" | "Rod" | "DrawerStack" | "Door";
 
 type ObstacleType = "LightSwitch" | "Outlet" | "Window" | "Unknown";
 
@@ -21,6 +25,9 @@ interface ClosetComp {
   type:          CompType;
   positionIn:    number;
   drawerHeights: number[];
+  // Door-specific fields
+  doorHeightIn?: number;   // Door: height in inches (default 80, capped at section effH)
+  doorFlipped?:  boolean;  // Door: false = handle on right (default), true = handle on left
 }
 
 interface Obstacle {
@@ -74,14 +81,14 @@ type Selection =
   | null;
 
 type DragState =
-  | { kind: "left-end";          wallId: string; startX: number; startIn: number }
-  | { kind: "right-end";         wallId: string; startX: number; endIn: number }
+  | { kind: "left-end";          wallId: string; startX: number; startIn: number; flipped: boolean }
+  | { kind: "right-end";         wallId: string; startX: number; endIn: number; flipped: boolean }
   | { kind: "left-end-height";   wallId: string; startY: number; startHeightIn: number }
   | { kind: "right-end-height";  wallId: string; startY: number; startHeightIn: number }
-  | { kind: "panel";             wallId: string; panelIdx: number; startX: number; startXIn: number }
+  | { kind: "panel";             wallId: string; panelIdx: number; startX: number; startXIn: number; flipped: boolean }
   | { kind: "panel-height";      wallId: string; panelIdx: number; startY: number; startHeightIn: number }
   | { kind: "comp";              wallId: string; secId: number; compId: number; startY: number; startPosIn: number }
-  | { kind: "obstacle";          wallId: string; obsId: number; startX: number; startY: number; startXIn: number; startYIn: number };
+  | { kind: "obstacle";          wallId: string; obsId: number; startX: number; startY: number; startXIn: number; startYIn: number; flipped: boolean };
 
 type ViewMode = "front" | "top" | "split";
 
@@ -98,6 +105,9 @@ const DRAWER_MAX_TOP = 50;   // drawer stack top cannot exceed this height from 
 const DRAWER_MAX_W   = 36;   // drawer section max width (inches)
 const LOCK_SPAN_MIN  = 43;   // shelf/rod locked when span >= this (43–48" range)
 const MAX_SPAN_IN    = 48;   // shelf/rod not allowed when span > this
+const DOOR_MAX_SEC_W = 24;   // door only allowed in sections ≤ this width
+const DOOR_MAX_H_IN  = 96;   // door leaf max height (inches)
+const DOOR_DEFAULT_H = 80;   // door leaf default height
 const PAD_TOP        = 40;
 const PAD_BOT        = 32;
 const H_PAD          = 44;   // horizontal SVG padding (ruler space on left)
@@ -118,6 +128,8 @@ const C_INT      = "#f5f0e8";   // active system interior
 const C_GAP      = "#e2ddd7";   // unused wall area
 const C_INT_BD   = "#d4cfc8";
 const C_HANGER   = "#9a6840";
+const C_DOOR     = "#a8c8e8";   // door leaf fill (semi-transparent glass effect)
+const C_DOOR_BD  = "#5a8ab0";   // door leaf border/frame
 
 // Obstacle colors by type
 const OBS_FILL: Record<ObstacleType, string> = {
@@ -259,6 +271,12 @@ function runMovePanel(run: WallRun, panelIdx: number, newX: number): WallRun {
   if (run.sections[panelIdx + 1]?.comps.some(c => c.type === "Shelf" || c.type === "Rod")) {
     minX = Math.max(minX, rightEnd - PANEL_W_IN - MAX_SPAN_IN);
   }
+  if (run.sections[panelIdx]?.comps.some(c => c.type === "Door")) {
+    maxX = Math.min(maxX, leftStart + DOOR_MAX_SEC_W);
+  }
+  if (run.sections[panelIdx + 1]?.comps.some(c => c.type === "Door")) {
+    minX = Math.max(minX, rightEnd - PANEL_W_IN - DOOR_MAX_SEC_W);
+  }
   return {
     ...run,
     panels: run.panels.map((p, i) => i === panelIdx ? { ...p, xIn: Math.max(minX, Math.min(maxX, newX)) } : p),
@@ -277,6 +295,10 @@ function runMoveLeftEnd(run: WallRun, newStart: number): WallRun {
   if (run.sections[0]?.comps.some(c => c.type === "Shelf" || c.type === "Rod")) {
     minStart = Math.max(minStart, firstPanelX - MAX_SPAN_IN);
   }
+  // Door: prevent section from exceeding DOOR_MAX_SEC_W (can still shrink freely)
+  if (run.sections[0]?.comps.some(c => c.type === "Door")) {
+    minStart = Math.max(minStart, firstPanelX - DOOR_MAX_SEC_W);
+  }
   return { ...run, startIn: Math.max(minStart, Math.max(0, Math.min(maxStart, newStart))) };
 }
 
@@ -294,6 +316,10 @@ function runMoveRightEnd(run: WallRun, newEnd: number, wallW: number): WallRun {
   if (lastSec?.comps.some(c => c.type === "Shelf" || c.type === "Rod")) {
     maxEnd = Math.min(maxEnd, lastSecStart + MAX_SPAN_IN);
   }
+  // Door: prevent section from exceeding DOOR_MAX_SEC_W (can still shrink freely)
+  if (lastSec?.comps.some(c => c.type === "Door")) {
+    maxEnd = Math.min(maxEnd, lastSecStart + DOOR_MAX_SEC_W);
+  }
   return { ...run, endIn: Math.max(minEnd, Math.min(maxEnd, Math.min(wallW, newEnd))) };
 }
 
@@ -307,14 +333,106 @@ function runUpdateEndPanel(run: WallRun, side: "left" | "right", heightIn: numbe
     : { ...run, rightPanelHeightIn: heightIn };
 }
 
+/**
+ * Compute the minimum section depth when a door is present, based on what else is in the section.
+ * RULE A — rod behind door:     depth ≥ 24" (rod base 12" + door extra 12")
+ * RULE B — shelves behind door: depth ≥ 16" (shelf base 12" + door extra  4")
+ * RULE C — drawers behind door: depth ≥ 22" (drawer base 16" + door extra  6")
+ * Without a door the standard minimums apply (12" or 16" for drawers).
+ */
+function sectionMinDepth(sec: Section): number {
+  const hasDoor    = sec.comps.some(c => c.type === "Door");
+  const hasDrawers = sec.comps.some(c => c.type === "DrawerStack");
+  const hasRods    = sec.comps.some(c => c.type === "Rod");
+  if (hasDoor) {
+    if (hasRods)    return 24;  // Rule A
+    if (hasDrawers) return 22;  // Rule C
+    return 16;                  // Rule B (shelves or empty)
+  }
+  return hasDrawers ? 16 : 12;
+}
+
 function runUpdateSection(run: WallRun, secId: number, u: Partial<Section>): WallRun {
-  // Enforce minimum depth: 16" for drawer sections, 12" for all others
   if (u.depthIn !== undefined) {
-    const sec = run.sections.find(s => s.id === secId);
-    const hasDrawers = sec?.comps.some(c => c.type === "DrawerStack") ?? false;
-    u = { ...u, depthIn: Math.max(hasDrawers ? 16 : 12, u.depthIn) };
+    const sec    = run.sections.find(s => s.id === secId);
+    const minD   = sec ? sectionMinDepth({ ...sec, ...u }) : 12;
+    u = { ...u, depthIn: Math.max(minD, u.depthIn) };
   }
   return { ...run, sections: run.sections.map(s => s.id === secId ? { ...s, ...u } : s) };
+}
+
+/**
+ * Resize section[si] to desiredW by moving its boundary panel.
+ * - Prefers moving the RIGHT panel (panels[si]) — keeps left edge fixed.
+ * - Falls back to the LEFT panel (panels[si-1]) for the rightmost section.
+ * - Single-section run (no panels): no-op — run endpoints aren't changed here.
+ * Clamps to component constraints (drawers ≤36", doors ≤24", shelves/rods ≤48")
+ * and ensures the affected neighbor section stays within [MIN_SEC_W, neighborMax].
+ */
+function runSetSectionWidth(run: WallRun, si: number, desiredW: number, wallWidthIn?: number): WallRun {
+  const L   = secLeft(run.panels, run.startIn, si);
+  const sec = run.sections[si];
+  if (!sec) return run;
+
+  // Max width for this section based on its own components
+  let maxW = MAX_SPAN_IN;
+  if (sec.comps.some(c => c.type === "DrawerStack")) maxW = Math.min(maxW, DRAWER_MAX_W);
+  if (sec.comps.some(c => c.type === "Door"))        maxW = Math.min(maxW, DOOR_MAX_SEC_W);
+
+  // Component-driven max for a neighboring section
+  function neighborMax(s: Section): number {
+    let m = MAX_SPAN_IN;
+    if (s.comps.some(c => c.type === "DrawerStack")) m = Math.min(m, DRAWER_MAX_W);
+    if (s.comps.some(c => c.type === "Door"))        m = Math.min(m, DOOR_MAX_SEC_W);
+    return m;
+  }
+
+  if (si < run.panels.length) {
+    // ── Move right panel (run.panels[si]) ────────────────────────────────────
+    const rightEnd  = si + 1 === run.panels.length ? run.endIn : run.panels[si + 1].xIn;
+    // This section can't grow so large that right neighbor < MIN_SEC_W
+    const maxFromNeighborSpace = rightEnd - L - PANEL_W_IN - MIN_SEC_W;
+    // This section can't shrink so much that right neighbor > its own componentMax
+    const rightNMax = run.sections[si + 1] ? neighborMax(run.sections[si + 1]) : MAX_SPAN_IN;
+    const minFromNeighborMax   = rightNMax < MAX_SPAN_IN
+      ? Math.max(MIN_SEC_W, rightEnd - L - PANEL_W_IN - rightNMax)
+      : MIN_SEC_W;
+
+    const clamped = Math.max(
+      minFromNeighborMax,
+      Math.min(maxW, Math.min(maxFromNeighborSpace, Math.max(MIN_SEC_W, desiredW)))
+    );
+    return {
+      ...run,
+      panels: run.panels.map((p, i) => i === si ? { ...p, xIn: L + clamped } : p),
+    };
+  } else {
+    // ── Move left panel (run.panels[si-1]) for rightmost section ─────────────
+    if (si === 0 && run.panels.length === 0) {
+      // Single-section run: adjust endIn directly
+      const maxAvail = (wallWidthIn ?? run.endIn) - run.startIn;
+      const clamped  = Math.max(MIN_SEC_W, Math.min(maxW, Math.min(maxAvail, desiredW)));
+      return { ...run, endIn: run.startIn + clamped };
+    }
+    if (si === 0) return run; // guard: shouldn't reach here
+    const leftIdx    = si - 1;
+    const R          = run.endIn;  // right edge fixed
+    const leftNStart = leftIdx === 0 ? run.startIn : run.panels[leftIdx - 1].xIn + PANEL_W_IN;
+    const maxFromNeighborSpace = R - leftNStart - PANEL_W_IN - MIN_SEC_W;
+    const leftNMax  = run.sections[si - 1] ? neighborMax(run.sections[si - 1]) : MAX_SPAN_IN;
+    const minFromNeighborMax   = leftNMax < MAX_SPAN_IN
+      ? Math.max(MIN_SEC_W, R - leftNStart - PANEL_W_IN - leftNMax)
+      : MIN_SEC_W;
+
+    const clamped = Math.max(
+      minFromNeighborMax,
+      Math.min(maxW, Math.min(maxFromNeighborSpace, Math.max(MIN_SEC_W, desiredW)))
+    );
+    return {
+      ...run,
+      panels: run.panels.map((p, i) => i === leftIdx ? { ...p, xIn: R - clamped - PANEL_W_IN } : p),
+    };
+  }
 }
 
 /**
@@ -343,6 +461,10 @@ function runAddComp(run: WallRun, secId: number, type: CompType, sysH: number): 
   if (type === "DrawerStack") {
     if (si !== -1 && secWidth(run.panels, run.startIn, run.endIn, si) > DRAWER_MAX_W) return run;
   }
+  // Door not allowed in sections wider than DOOR_MAX_SEC_W
+  if (type === "Door") {
+    if (si !== -1 && secWidth(run.panels, run.startIn, run.endIn, si) > DOOR_MAX_SEC_W) return run;
+  }
   // Use section effective height (min of bounding panels) for default placement
   const effH = si >= 0 ? sectionEffH(run, si, sysH) : sysH;
   const dh   = [8, 8, 8];
@@ -351,8 +473,14 @@ function runAddComp(run: WallRun, secId: number, type: CompType, sysH: number): 
     id: nextId(), type,
     positionIn: type === "DrawerStack"
       ? Math.max(LOCK_H_IN, Math.min(DRAWER_MAX_TOP - tot, effH - tot - LOCK_H_IN))
+      : type === "Door"
+      ? 0
       : Math.floor(effH / 2),
     drawerHeights: type === "DrawerStack" ? dh : [],
+    ...(type === "Door" ? {
+      doorHeightIn: Math.min(DOOR_DEFAULT_H, effH),
+      doorFlipped:  false,
+    } : {}),
   };
   const withComp = { ...run, sections: run.sections.map(s => s.id === secId ? { ...s, comps: [...s.comps, comp] } : s) };
   // Drawers require a minimum 16" depth — enforce immediately
@@ -363,6 +491,21 @@ function runAddComp(run: WallRun, secId: number, type: CompType, sysH: number): 
         s.id === secId ? { ...s, depthIn: Math.max(16, s.depthIn) } : s
       ),
     };
+  }
+  // Door: enforce minimum depth based on what else is in the section
+  if (type === "Door") {
+    const sec = withComp.sections.find(s => s.id === secId);
+    if (sec) {
+      const minDepth = sectionMinDepth(sec);
+      if (sec.depthIn < minDepth) {
+        return {
+          ...withComp,
+          sections: withComp.sections.map(s =>
+            s.id === secId ? { ...s, depthIn: minDepth } : s
+          ),
+        };
+      }
+    }
   }
   return withComp;
 }
@@ -421,12 +564,13 @@ function runCornerDepth(run: WallRun, side: "left" | "right"): number {
 }
 
 interface CornerConstraint {
-  cornerKey:  string;
-  wallId:     string;            // cut-short wall's id
-  side:       "left" | "right";  // which end of the cut-short wall is constrained
-  cutbackIn:  number;            // required clear distance from that end (inches)
-  otherLabel: string;            // full-length wall's label (for display)
-  violated:   boolean;
+  cornerKey:   string;
+  wallId:      string;            // cut-short wall's id
+  side:        "left" | "right";  // data-space side (used for violated check)
+  displaySide: "left" | "right";  // visual side in elevation (accounts for footprintFlipped)
+  cutbackIn:   number;            // required clear distance from that end (inches)
+  otherLabel:  string;            // full-length wall's label (for display)
+  violated:    boolean;
 }
 
 /**
@@ -457,29 +601,35 @@ function deriveConstraints(
     if (!aRun || !bRun) continue;
 
     // A full-length at its right end → B needs left clearance
+    // displaySide: if B's footprint is flipped, B's user sees this corner on their RIGHT.
     if (fullSet.has(a.id)) {
-      const cutback = runCornerDepth(aRun, "right") + 12;
+      const cutback   = runCornerDepth(aRun, "right") + 12;
+      const bFlipped  = b.footprintFlipped ?? false;
       out.push({
-        cornerKey:  `${a.id}:${b.id}:a`,
-        wallId:     b.id,
-        side:       "left",
-        cutbackIn:  cutback,
-        otherLabel: labelOf(a.id),
-        violated:   bRun.startIn < cutback,
+        cornerKey:   `${a.id}:${b.id}:a`,
+        wallId:      b.id,
+        side:        "left",
+        displaySide: bFlipped ? "right" : "left",
+        cutbackIn:   cutback,
+        otherLabel:  labelOf(a.id),
+        violated:    bRun.startIn < cutback,
       });
     }
 
     // B full-length at its left end → A needs right clearance
+    // displaySide: if A's footprint is flipped, A's user sees this corner on their LEFT.
     if (fullSet.has(b.id)) {
-      const cutback = runCornerDepth(bRun, "left") + 12;
-      const aWall   = wallMap.get(a.id);
+      const cutback   = runCornerDepth(bRun, "left") + 12;
+      const aWall     = wallMap.get(a.id);
+      const aFlipped  = a.footprintFlipped ?? false;
       out.push({
-        cornerKey:  `${a.id}:${b.id}:b`,
-        wallId:     a.id,
-        side:       "right",
-        cutbackIn:  cutback,
-        otherLabel: labelOf(b.id),
-        violated:   aRun.endIn > (aWall?.widthIn ?? 120) - cutback,
+        cornerKey:   `${a.id}:${b.id}:b`,
+        wallId:      a.id,
+        side:        "right",
+        displaySide: aFlipped ? "left" : "right",
+        cutbackIn:   cutback,
+        otherLabel:  labelOf(b.id),
+        violated:    aRun.endIn > (aWall?.widthIn ?? 120) - cutback,
       });
     }
   }
@@ -503,13 +653,20 @@ function buildWallLabelMap(walls: DesignWall[]): Map<string, string> {
 // ─── Component helpers ────────────────────────────────────────────────────────
 
 function compHeight(comp: ClosetComp): number {
-  return comp.type === "DrawerStack" ? comp.drawerHeights.reduce((a, b) => a + b, 0) : 1;
+  if (comp.type === "DrawerStack") return comp.drawerHeights.reduce((a, b) => a + b, 0);
+  if (comp.type === "Door")        return comp.doorHeightIn ?? DOOR_DEFAULT_H;
+  return 1;
 }
 
 /** effH = section effective height (min of bounding panel heights). */
 function resolvePos(comp: ClosetComp, effH: number, raw: number, all: ClosetComp[]): number {
   const cH = compHeight(comp);
   const min = LOCK_H_IN;
+  // Doors start at floor (positionIn = 0), but clamp to fit within section height
+  if (comp.type === "Door") {
+    const max = Math.max(0, effH - cH);
+    return Math.max(0, Math.min(max, Math.round(raw / SNAP_IN) * SNAP_IN));
+  }
   // Enforce 50" drawer-top ceiling
   const max = comp.type === "DrawerStack"
     ? Math.min(effH - LOCK_H_IN - cH, DRAWER_MAX_TOP - cH)
@@ -722,7 +879,7 @@ function DrawerFace({ x, y, w, h, selected }: {
 // ─── Wall Canvas ──────────────────────────────────────────────────────────────
 
 function WallCanvas({
-  run, wall, sysH, ceilingH, selection, onSelect, onDragStart, onAddPanelAt, cornerConstraints, zoom,
+  run, wall, sysH, ceilingH, selection, onSelect, onDragStart, onAddPanelAt, cornerConstraints, zoom, flipped,
 }: {
   run:               WallRun;
   wall:              DesignWall;
@@ -734,21 +891,51 @@ function WallCanvas({
   onAddPanelAt:      (xIn: number) => void;
   cornerConstraints: CornerConstraint[];
   zoom:              number;
+  flipped?:          boolean;
 }) {
   const obstacles      = run.obstacles ?? [];
   const wallCorners    = cornerConstraints.filter(c => c.wallId === wall.id);
   const svgRef         = useRef<SVGSVGElement>(null);
-  const wallW          = wall.widthIn * SCALE;
+  const wallWidthIn    = wall.widthIn;
+  const wallW          = wallWidthIn * SCALE;
   const wallH          = ceilingH * SCALE;   // canvas spans full ceiling height — no sysH cap
   const SYSTEM_TOP_Y   = PAD_TOP;            // ceiling is the top of the canvas
   const svgW           = wallW + H_PAD * 2 + 16;
   const svgH           = SYSTEM_TOP_Y + wallH + PAD_BOT;
-  const sysX           = H_PAD + run.startIn * SCALE;
-  const sysW           = (run.endIn - run.startIn) * SCALE;
+
+  // ── Flip-aware coordinate helpers ──────────────────────────────────────────
+  // When footprintFlipped=true the user stands on the opposite side of the wall,
+  // so their perceived left/right is reversed relative to the polygon coordinate
+  // order (startIn=0 ↔ endIn=wallWidth). Mirror the x-axis so the elevation
+  // matches what the user sees when facing the closet.
+
+  /** Convert a single data-space xIn to canvas pixel x. */
+  function xAt(xIn: number): number {
+    return flipped
+      ? H_PAD + (wallWidthIn - xIn) * SCALE
+      : H_PAD + xIn * SCALE;
+  }
+
+  /**
+   * Convert a data-space range [xLIn, xRIn] to [canvas_x_left, canvas_width].
+   * The canvas_x_left is always the left-most pixel (smaller x value).
+   */
+  function xRange(xLIn: number, xRIn: number): [number, number] {
+    const w = (xRIn - xLIn) * SCALE;
+    const x = flipped
+      ? H_PAD + (wallWidthIn - xRIn) * SCALE
+      : H_PAD + xLIn * SCALE;
+    return [x, w];
+  }
+
+  const [sysX, sysW] = xRange(run.startIn, run.endIn);
+  const [lepX]       = xRange(run.startIn, run.startIn + PANEL_W_IN);   // left end panel canvas x
+  const [repX]       = xRange(run.endIn - PANEL_W_IN, run.endIn);        // right end panel canvas x
 
   function toXIn(e: { clientX: number }): number {
     const r = svgRef.current!.getBoundingClientRect();
-    return ((e.clientX - r.left) / zoom - H_PAD) / SCALE;
+    const rawXIn = ((e.clientX - r.left) / zoom - H_PAD) / SCALE;
+    return flipped ? wallWidthIn - rawXIn : rawXIn;
   }
 
   function floorY(posIn: number): number {
@@ -796,41 +983,44 @@ function WallCanvas({
         fill={C_INT} stroke="none" />
 
       {/* ── Corner clearance zones ── */}
+      {/* Use displaySide (not side) so the zone appears on the correct visual end
+          when footprintFlipped reverses the user's perceived left/right.        */}
       {wallCorners.map(cc => {
-        const zonePx  = cc.cutbackIn * SCALE;
+        const zonePx   = cc.cutbackIn * SCALE;
         const violated = cc.violated;
-        const fill    = violated ? "#fee2e2" : "#fff7ed";
-        const stroke  = violated ? "#dc2626" : "#f97316";
-        const opacity = violated ? 0.75 : 0.6;
-        if (cc.side === "left") {
-          const xPx = H_PAD;
-          const wPx = Math.min(zonePx, wallW);
+        const fill     = violated ? "#fee2e2" : "#fff7ed";
+        const stroke   = violated ? "#dc2626" : "#f97316";
+        const opacity  = violated ? 0.75 : 0.6;
+        if (cc.displaySide === "left") {
+          const rectX = H_PAD;
+          const rectW = Math.min(zonePx, wallW);
+          const lineX = rectX + rectW;
           return (
             <g key={cc.cornerKey} pointerEvents="none">
-              <rect x={xPx} y={SYSTEM_TOP_Y} width={wPx} height={wallH}
+              <rect x={rectX} y={SYSTEM_TOP_Y} width={rectW} height={wallH}
                 fill={fill} opacity={opacity} />
-              <line x1={xPx + wPx} y1={SYSTEM_TOP_Y} x2={xPx + wPx} y2={SYSTEM_TOP_Y + wallH}
+              <line x1={lineX} y1={SYSTEM_TOP_Y} x2={lineX} y2={SYSTEM_TOP_Y + wallH}
                 stroke={stroke} strokeWidth={1.5} strokeDasharray="5 3" />
-              <text x={xPx + wPx / 2} y={SYSTEM_TOP_Y + wallH / 2}
+              <text x={rectX + rectW / 2} y={SYSTEM_TOP_Y + wallH / 2}
                 textAnchor="middle" fontSize={9} fill={stroke} fontWeight="700"
-                transform={`rotate(-90,${xPx + wPx / 2},${SYSTEM_TOP_Y + wallH / 2})`}>
+                transform={`rotate(-90,${rectX + rectW / 2},${SYSTEM_TOP_Y + wallH / 2})`}>
                 {cc.cutbackIn}" clear · {cc.otherLabel} full
               </text>
             </g>
           );
         } else {
-          const xPx = H_PAD + (wall.widthIn - cc.cutbackIn) * SCALE;
-          const wPx = Math.min(zonePx, wallW);
-          const clamped = Math.max(H_PAD, xPx);
+          const rectX   = Math.max(H_PAD, H_PAD + wallW - zonePx);
+          const rectW   = H_PAD + wallW - rectX;
+          const lineX   = rectX;
           return (
             <g key={cc.cornerKey} pointerEvents="none">
-              <rect x={clamped} y={SYSTEM_TOP_Y} width={H_PAD + wallW - clamped} height={wallH}
+              <rect x={rectX} y={SYSTEM_TOP_Y} width={rectW} height={wallH}
                 fill={fill} opacity={opacity} />
-              <line x1={clamped} y1={SYSTEM_TOP_Y} x2={clamped} y2={SYSTEM_TOP_Y + wallH}
+              <line x1={lineX} y1={SYSTEM_TOP_Y} x2={lineX} y2={SYSTEM_TOP_Y + wallH}
                 stroke={stroke} strokeWidth={1.5} strokeDasharray="5 3" />
-              <text x={clamped + (H_PAD + wallW - clamped) / 2} y={SYSTEM_TOP_Y + wallH / 2}
+              <text x={rectX + rectW / 2} y={SYSTEM_TOP_Y + wallH / 2}
                 textAnchor="middle" fontSize={9} fill={stroke} fontWeight="700"
-                transform={`rotate(-90,${clamped + (H_PAD + wallW - clamped) / 2},${SYSTEM_TOP_Y + wallH / 2})`}>
+                transform={`rotate(-90,${rectX + rectW / 2},${SYSTEM_TOP_Y + wallH / 2})`}>
                 {cc.cutbackIn}" clear · {cc.otherLabel} full
               </text>
             </g>
@@ -841,10 +1031,10 @@ function WallCanvas({
       {/* Wall total width label */}
       <text x={H_PAD + wallW / 2} y={SYSTEM_TOP_Y - 22}
         textAnchor="middle" fontSize={11} fill="#aaa" fontWeight="600">
-        Wall: {wall.widthIn}"
+        Wall: {wallWidthIn}"
       </text>
-      {/* System span label */}
-      <text x={sysX + sysW / 2} y={SYSTEM_TOP_Y - 10}
+      {/* System span label — centred on the system region regardless of flip */}
+      <text x={xAt((run.startIn + run.endIn) / 2)} y={SYSTEM_TOP_Y - 10}
         textAnchor="middle" fontSize={11} fill={C_DIM} fontWeight="700">
         System: {(run.endIn - run.startIn).toFixed(1)}"
       </text>
@@ -853,30 +1043,30 @@ function WallCanvas({
       <line x1={sysX}        y1={SYSTEM_TOP_Y - 8} x2={sysX}        y2={SYSTEM_TOP_Y - 2} stroke="#bbb" strokeWidth={1} />
       <line x1={sysX + sysW} y1={SYSTEM_TOP_Y - 8} x2={sysX + sysW} y2={SYSTEM_TOP_Y - 2} stroke="#bbb" strokeWidth={1} />
 
-      {/* Gap labels */}
+      {/* Gap labels — midpoint of gap region in canvas space via xAt() */}
       {run.startIn > 0.5 && (
-        <text x={H_PAD + (run.startIn * SCALE) / 2} y={SYSTEM_TOP_Y + wallH / 2}
-          textAnchor="middle" fontSize={10} fill="#aaa" transform={`rotate(-90, ${H_PAD + (run.startIn * SCALE) / 2}, ${SYSTEM_TOP_Y + wallH / 2})`}>
+        <text x={xAt(run.startIn / 2)} y={SYSTEM_TOP_Y + wallH / 2}
+          textAnchor="middle" fontSize={10} fill="#aaa"
+          transform={`rotate(-90, ${xAt(run.startIn / 2)}, ${SYSTEM_TOP_Y + wallH / 2})`}>
           {run.startIn.toFixed(1)}" gap
         </text>
       )}
-      {wall.widthIn - run.endIn > 0.5 && (
+      {wallWidthIn - run.endIn > 0.5 && (
         <text
-          x={H_PAD + run.endIn * SCALE + (wall.widthIn - run.endIn) * SCALE / 2}
+          x={xAt(run.endIn + (wallWidthIn - run.endIn) / 2)}
           y={SYSTEM_TOP_Y + wallH / 2}
           textAnchor="middle" fontSize={10} fill="#aaa"
-          transform={`rotate(-90, ${H_PAD + run.endIn * SCALE + (wall.widthIn - run.endIn) * SCALE / 2}, ${SYSTEM_TOP_Y + wallH / 2})`}>
-          {(wall.widthIn - run.endIn).toFixed(1)}" gap
+          transform={`rotate(-90, ${xAt(run.endIn + (wallWidthIn - run.endIn) / 2)}, ${SYSTEM_TOP_Y + wallH / 2})`}>
+          {(wallWidthIn - run.endIn).toFixed(1)}" gap
         </text>
       )}
 
       {/* ── Sections ── */}
       {run.sections.map((sec, si) => {
-        const lxIn  = secLeft(run.panels, run.startIn, si);
-        const sw    = secWidth(run.panels, run.startIn, run.endIn, si);
-        const xPx   = H_PAD + lxIn * SCALE;
-        const wPx   = sw * SCALE;
-        const isSel = selection?.kind === "section" && selection.secId === sec.id;
+        const lxIn       = secLeft(run.panels, run.startIn, si);
+        const sw         = secWidth(run.panels, run.startIn, run.endIn, si);
+        const [xPx, wPx] = xRange(lxIn, lxIn + sw);
+        const isSel      = selection?.kind === "section" && selection.secId === sec.id;
 
         const effH   = sectionEffH(run, si, sysH);
         const effHPx = effH * SCALE;
@@ -898,8 +1088,8 @@ function WallCanvas({
                 fill="none" stroke={C_SELECT} strokeWidth={1.5} pointerEvents="none" />
             </>}
 
-            {/* Width label */}
-            <text x={xPx + wPx / 2} y={SYSTEM_TOP_Y + wallH + 20}
+            {/* Width label — always at section midpoint in canvas */}
+            <text x={xAt(lxIn + sw / 2)} y={SYSTEM_TOP_Y + wallH + 20}
               textAnchor="middle" fontSize={10}
               fill={isSel ? C_SELECT : C_DIM} fontWeight={isSel ? "700" : "400"}>
               {sw.toFixed(1)}"
@@ -986,6 +1176,43 @@ function WallCanvas({
                   </g>
                 );
               }
+
+              if (comp.type === "Door") {
+                // Door spans full section width (panel-to-panel)
+                const dh2    = comp.doorHeightIn ?? DOOR_DEFAULT_H;
+                const dhPx   = dh2 * SCALE;
+                const dyPx   = floorY(comp.positionIn + dh2);
+                // Handle position: flipped = left side (20%), default = right side (80%)
+                const flipped = comp.doorFlipped ?? false;
+                const hxPx   = xPx + wPx * (flipped ? 0.20 : 0.80);
+                return (
+                  <g key={comp.id} style={{ cursor: "ns-resize" }} onPointerDown={startDrag}>
+                    {/* Door panel — spans full section width, semi-transparent */}
+                    <rect x={xPx} y={dyPx} width={wPx} height={dhPx}
+                      fill={C_DOOR} opacity={isSC ? 0.75 : 0.50}
+                      stroke={isSC ? C_SELECT : C_DOOR_BD}
+                      strokeWidth={isSC ? 2 : 1.5} rx={1} />
+                    {/* Inner frame lines (top + bottom rail) */}
+                    <line x1={xPx + 4} y1={dyPx + 8} x2={xPx + wPx - 4} y2={dyPx + 8}
+                      stroke={C_DOOR_BD} strokeWidth={1} opacity={0.35} pointerEvents="none" />
+                    <line x1={xPx + 4} y1={dyPx + dhPx - 8} x2={xPx + wPx - 4} y2={dyPx + dhPx - 8}
+                      stroke={C_DOOR_BD} strokeWidth={1} opacity={0.35} pointerEvents="none" />
+                    {/* Handle bar */}
+                    <line x1={hxPx} y1={dyPx + dhPx * 0.42}
+                          x2={hxPx} y2={dyPx + dhPx * 0.58}
+                      stroke={C_DOOR_BD} strokeWidth={3} strokeLinecap="round" pointerEvents="none" />
+                    <circle cx={hxPx} cy={dyPx + dhPx * 0.5} r={3}
+                      fill={C_DOOR_BD} opacity={0.75} pointerEvents="none" />
+                    {/* Height label */}
+                    <text x={xPx + wPx / 2} y={dyPx + dhPx / 2 + 4}
+                      textAnchor="middle" fontSize={8} fill={isSC ? C_SELECT : C_DOOR_BD}
+                      fontWeight="600" pointerEvents="none">
+                      {dh2}"
+                    </text>
+                  </g>
+                );
+              }
+
               return null;
             })}
           </g>
@@ -994,14 +1221,13 @@ function WallCanvas({
 
       {/* ── Obstacles (wall-absolute, above components, below panels) ── */}
       {obstacles.map(obs => {
-        const isSel = selection?.kind === "obstacle" && selection.obsId === obs.id;
-        const xPx   = H_PAD + obs.xIn * SCALE;
-        const yPx   = floorY(obs.yIn + obs.hIn);   // floorY already uses SYSTEM_TOP_Y
-        const wPx   = obs.wIn * SCALE;
-        const hPx   = obs.hIn * SCALE;
-        const fill  = OBS_FILL[obs.type];
-        const stroke= isSel ? C_SELECT : OBS_STROKE[obs.type];
-        const lbl   = OBS_LABEL[obs.type];
+        const isSel         = selection?.kind === "obstacle" && selection.obsId === obs.id;
+        const [xPx, wPx]    = xRange(obs.xIn, obs.xIn + obs.wIn);
+        const yPx           = floorY(obs.yIn + obs.hIn);
+        const hPx           = obs.hIn * SCALE;
+        const fill          = OBS_FILL[obs.type];
+        const stroke        = isSel ? C_SELECT : OBS_STROKE[obs.type];
+        const lbl           = OBS_LABEL[obs.type];
         return (
           <g key={obs.id} style={{ cursor: "move" }}
             onClick={e => { e.stopPropagation(); onSelect({ kind: "obstacle", obsId: obs.id }); }}
@@ -1012,6 +1238,7 @@ function WallCanvas({
                 kind: "obstacle", wallId: run.wallId, obsId: obs.id,
                 startX: e.clientX, startY: e.clientY,
                 startXIn: obs.xIn, startYIn: obs.yIn,
+                flipped: flipped ?? false,
               }, e);
             }}>
             <rect x={xPx} y={yPx} width={wPx} height={hPx}
@@ -1031,12 +1258,12 @@ function WallCanvas({
 
       {/* ── Interior panels ── */}
       {run.panels.map((panel, pi) => {
-        const xPx    = H_PAD + panel.xIn * SCALE;
-        const isSel  = selection?.kind === "panel" && selection.panelId === panel.id;
-        const pH      = panelH(panel, sysH);
-        const pHPx    = pH * SCALE;
-        const panTopY = SYSTEM_TOP_Y + wallH - pHPx;
-        const isCustomH = panel.heightIn !== undefined;   // any explicit override — shorter OR taller
+        const [xPx]     = xRange(panel.xIn, panel.xIn + PANEL_W_IN);
+        const isSel     = selection?.kind === "panel" && selection.panelId === panel.id;
+        const pH        = panelH(panel, sysH);
+        const pHPx      = pH * SCALE;
+        const panTopY   = SYSTEM_TOP_Y + wallH - pHPx;
+        const isCustomH = panel.heightIn !== undefined;
         return (
           <g key={panel.id}>
             <rect x={xPx} y={panTopY} width={PANEL_W_PX} height={pHPx}
@@ -1048,7 +1275,7 @@ function WallCanvas({
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "panel", panelId: panel.id });
                 onDragStart({ kind: "panel", wallId: run.wallId, panelIdx: pi,
-                  startX: e.clientX, startXIn: panel.xIn }, e);
+                  startX: e.clientX, startXIn: panel.xIn, flipped: flipped ?? false }, e);
               }}
             />
             {/* Height drag handle — tab at panel top */}
@@ -1079,7 +1306,7 @@ function WallCanvas({
       })}
 
       {/* ── End panels — LAST (highest z), draggable ── */}
-      {/* Left end panel */}
+      {/* Left end panel — appears at lepX in canvas (data-left end, visual-right when flipped) */}
       {(() => {
         const lpH      = run.leftPanelHeightIn ?? sysH;
         const lpHPx    = lpH * SCALE;
@@ -1087,7 +1314,7 @@ function WallCanvas({
         const lpCustom = run.leftPanelHeightIn !== undefined;
         return (
           <g>
-            <rect x={sysX} y={lpTopY} width={PANEL_W_PX} height={lpHPx}
+            <rect x={lepX} y={lpTopY} width={PANEL_W_PX} height={lpHPx}
               fill={leftSelBorder ? C_SELECT : C_ENDPANEL}
               stroke={leftSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1.5}
               style={{ cursor: "ew-resize" }}
@@ -1095,11 +1322,12 @@ function WallCanvas({
               onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "left-end" });
-                onDragStart({ kind: "left-end", wallId: run.wallId, startX: e.clientX, startIn: run.startIn }, e);
+                onDragStart({ kind: "left-end", wallId: run.wallId, startX: e.clientX,
+                  startIn: run.startIn, flipped: flipped ?? false }, e);
               }}
             />
             {/* Height drag handle */}
-            <rect x={sysX - 4} y={lpTopY - 7} width={PANEL_W_PX + 8} height={14}
+            <rect x={lepX - 4} y={lpTopY - 7} width={PANEL_W_PX + 8} height={14}
               fill={leftSelBorder ? C_SELECT : (lpCustom ? "#d4a050" : C_ENDPANEL)}
               stroke={leftSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1}
               rx={3} style={{ cursor: "ns-resize" }}
@@ -1111,10 +1339,10 @@ function WallCanvas({
                   startY: e.clientY, startHeightIn: lpH }, e);
               }}
             />
-            <line x1={sysX + 1} y1={lpTopY + 4} x2={sysX + 1} y2={SYSTEM_TOP_Y + wallH - 4}
+            <line x1={lepX + 1} y1={lpTopY + 4} x2={lepX + 1} y2={SYSTEM_TOP_Y + wallH - 4}
               stroke="#fff" strokeWidth={1} opacity={0.25} pointerEvents="none" />
             {lpCustom && (
-              <text x={sysX + PANEL_W_PX / 2} y={lpTopY - 12}
+              <text x={lepX + PANEL_W_PX / 2} y={lpTopY - 12}
                 textAnchor="middle" fontSize={8} fill="#d4a050" fontWeight="700" pointerEvents="none">
                 {lpH}"
               </text>
@@ -1123,16 +1351,15 @@ function WallCanvas({
         );
       })()}
 
-      {/* Right end panel */}
+      {/* Right end panel — appears at repX in canvas (data-right end, visual-left when flipped) */}
       {(() => {
         const rpH      = run.rightPanelHeightIn ?? sysH;
         const rpHPx    = rpH * SCALE;
         const rpTopY   = SYSTEM_TOP_Y + wallH - rpHPx;
-        const rpX      = H_PAD + (run.endIn - PANEL_W_IN) * SCALE;
         const rpCustom = run.rightPanelHeightIn !== undefined;
         return (
           <g>
-            <rect x={rpX} y={rpTopY} width={PANEL_W_PX} height={rpHPx}
+            <rect x={repX} y={rpTopY} width={PANEL_W_PX} height={rpHPx}
               fill={rightSelBorder ? C_SELECT : C_ENDPANEL}
               stroke={rightSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1.5}
               style={{ cursor: "ew-resize" }}
@@ -1140,11 +1367,12 @@ function WallCanvas({
               onPointerDown={e => {
                 e.preventDefault(); e.stopPropagation();
                 onSelect({ kind: "right-end" });
-                onDragStart({ kind: "right-end", wallId: run.wallId, startX: e.clientX, endIn: run.endIn }, e);
+                onDragStart({ kind: "right-end", wallId: run.wallId, startX: e.clientX,
+                  endIn: run.endIn, flipped: flipped ?? false }, e);
               }}
             />
             {/* Height drag handle */}
-            <rect x={rpX - 4} y={rpTopY - 7} width={PANEL_W_PX + 8} height={14}
+            <rect x={repX - 4} y={rpTopY - 7} width={PANEL_W_PX + 8} height={14}
               fill={rightSelBorder ? C_SELECT : (rpCustom ? "#d4a050" : C_ENDPANEL)}
               stroke={rightSelBorder ? "#1a5ccc" : C_PANEL_BD} strokeWidth={1}
               rx={3} style={{ cursor: "ns-resize" }}
@@ -1156,10 +1384,10 @@ function WallCanvas({
                   startY: e.clientY, startHeightIn: rpH }, e);
               }}
             />
-            <line x1={rpX + 1} y1={rpTopY + 4} x2={rpX + 1} y2={SYSTEM_TOP_Y + wallH - 4}
+            <line x1={repX + 1} y1={rpTopY + 4} x2={repX + 1} y2={SYSTEM_TOP_Y + wallH - 4}
               stroke="#fff" strokeWidth={1} opacity={0.25} pointerEvents="none" />
             {rpCustom && (
-              <text x={rpX + PANEL_W_PX / 2} y={rpTopY - 12}
+              <text x={repX + PANEL_W_PX / 2} y={rpTopY - 12}
                 textAnchor="middle" fontSize={8} fill="#d4a050" fontWeight="700" pointerEvents="none">
                 {rpH}"
               </text>
@@ -1174,17 +1402,21 @@ function WallCanvas({
           fill={C_LOCK} stroke={C_LOCK_BD} strokeWidth={0.5} opacity={0.35} />
       </g>
 
-      {/* ── Above-ceiling zone — drawn last so it covers all wall content ── */}
+      {/* ── Above-ceiling zone — spans full wall width, drawn last so it covers all wall content ── */}
       {(() => {
-        const runW    = run.endIn - run.startIn;
+        const wallX   = H_PAD;   // left edge of wall in SVG space
         const profile: CeilingProfile = run.ceilingProfile ?? { type: "flat", heightIn: ceilingH };
-        const pts     = ceilingProfilePts(runW, profile);
-        // SVG coordinates for each ceiling boundary point
-        const svgPts  = pts.map(([xIn, hIn]) => [sysX + xIn * SCALE, floorY(hIn)] as [number, number]);
-        // Filled polygon: canvas top-left → canvas top-right → ceiling R-to-L → close
+        // Use wallWidthIn as span so the ceiling profile covers the entire wall, not just the system
+        const pts     = ceilingProfilePts(wallWidthIn, profile);
+        // SVG coordinates — mirror x when footprintFlipped so ceiling profile matches elevation orientation
+        const svgPts  = pts.map(([xIn, hIn]) => [
+          flipped ? wallX + (wallWidthIn - xIn) * SCALE : wallX + xIn * SCALE,
+          floorY(hIn),
+        ] as [number, number]);
+        // Filled polygon: wall top-left → wall top-right → ceiling R-to-L → close
         const fillPoly = [
-          [sysX,        SYSTEM_TOP_Y] as [number, number],
-          [sysX + sysW, SYSTEM_TOP_Y] as [number, number],
+          [wallX,           SYSTEM_TOP_Y] as [number, number],
+          [wallX + wallW,   SYSTEM_TOP_Y] as [number, number],
           ...svgPts.slice().reverse(),
         ].map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
         const linePts = svgPts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
@@ -1196,12 +1428,11 @@ function WallCanvas({
             {/* Ceiling boundary line */}
             <polyline points={linePts} fill="none"
               stroke="#6baed6" strokeWidth={1.5} strokeDasharray="6 4" />
-            {/* Height labels at profile key points */}
+            {/* Height labels at profile key points — use svgPts for flip-aware x */}
             {pts.map(([xIn, hIn], i) => {
-              const sx      = sysX + xIn * SCALE;
-              const sy      = floorY(hIn);
-              const isFirst = i === 0;
-              const prevH   = i > 0 ? pts[i - 1][1] : null;
+              const [sx, sy] = svgPts[i];
+              const isFirst  = i === 0;
+              const prevH    = i > 0 ? pts[i - 1][1] : null;
               if (prevH !== null && Math.abs(prevH - hIn) < 0.5 && xIn > 0) return null;
               return (
                 <g key={i}>
@@ -1217,9 +1448,9 @@ function WallCanvas({
                 </g>
               );
             })}
-            {/* Profile type badge */}
+            {/* Profile type badge — centred on the full wall */}
             {profile.type !== "flat" && (
-              <text x={sysX + sysW / 2} y={SYSTEM_TOP_Y - 6}
+              <text x={wallX + wallW / 2} y={SYSTEM_TOP_Y - 6}
                 textAnchor="middle" fontSize={8} fill="#6baed6" fontWeight="700">
                 {profile.type === "slope" ? "Sloped ceiling" : "Flat + slope ceiling"}
               </text>
@@ -1235,7 +1466,7 @@ function WallCanvas({
 
 function Inspector({
   selection, run, wall, sysH, ceilingH,
-  onUpdateSection, onAddComp, onUpdateComp, onDeleteComp,
+  onUpdateSection, onSetSectionWidth, onAddComp, onUpdateComp, onDeleteComp,
   onRemovePanel, onUpdatePanel, onUpdateEndPanel, onSetPanelDepth, onAddPanel, onClearSel,
   onUpdateObstacle, onDeleteObstacle, onAddObstacle,
   onUpdateCeilingProfile,
@@ -1246,6 +1477,7 @@ function Inspector({
   sysH:             number;
   ceilingH:         number;
   onUpdateSection:    (secId: number, u: Partial<Section>) => void;
+  onSetSectionWidth:  (si: number, w: number) => void;
   onAddComp:          (secId: number, type: CompType) => void;
   onUpdateComp:       (secId: number, compId: number, u: Partial<ClosetComp>) => void;
   onDeleteComp:       (secId: number, compId: number) => void;
@@ -1260,6 +1492,25 @@ function Inspector({
   onAddObstacle:      (type: ObstacleType) => void;
   onUpdateCeilingProfile: (p: CeilingProfile | undefined) => void;
 }) {
+  // ── Section width draft state (must be before any early return) ──────────────
+  // Tracks which section index is currently selected so we can reset the draft
+  // when the user selects a different section.
+  const selSi = (selection?.kind === "section" && run)
+    ? run.sections.findIndex(s => s.id === selection.secId)
+    : -1;
+  const selSw = selSi >= 0 && run
+    ? secWidth(run.panels, run.startIn, run.endIn, selSi)
+    : 0;
+  const [widthDraft, setWidthDraft] = useState(selSw > 0 ? String(Math.round(selSw * 10) / 10) : "");
+  const prevSelSiRef = useRef(selSi);
+  useEffect(() => {
+    // Reset draft whenever the selected section changes
+    if (prevSelSiRef.current !== selSi) {
+      setWidthDraft(selSw > 0 ? String(Math.round(selSw * 10) / 10) : "");
+      prevSelSiRef.current = selSi;
+    }
+  }, [selSi, selSw]);
+
   const inp: React.CSSProperties = {
     padding: "5px 8px", fontSize: "13px", border: "1px solid #c8c4be",
     borderRadius: "5px", backgroundColor: "#fff", color: "#111", width: "80px",
@@ -1448,8 +1699,7 @@ function Inspector({
     const lpH       = Math.min(run.leftPanelHeightIn ?? sysH, lpMaxH);
     const lpOpenSpc = lpMaxH - lpH;
     const sec0      = run.sections[0];
-    const lpHasD    = sec0?.comps.some(c => c.type === "DrawerStack") ?? false;
-    const lpMinD    = lpHasD ? 16 : 12;
+    const lpMinD    = sec0 ? sectionMinDepth(sec0) : 12;
     const lpD       = sec0?.depthIn ?? 12;
     return (
       <div style={{ padding: "16px" }}>
@@ -1491,16 +1741,16 @@ function Inspector({
           {metric(run.startIn.toFixed(1))}
         </div>
 
-        <div style={{ padding: "10px 12px", backgroundColor: lpHasD ? "#fffbf0" : "#faf8f5",
-          borderRadius: "6px", border: `1px solid ${lpHasD ? "#e8c870" : "#e8e4de"}`, marginBottom: "14px" }}>
+        <div style={{ padding: "10px 12px", backgroundColor: lpMinD > 12 ? "#fffbf0" : "#faf8f5",
+          borderRadius: "6px", border: `1px solid ${lpMinD > 12 ? "#e8c870" : "#e8e4de"}`, marginBottom: "14px" }}>
           <span style={lbl}>Depth (sets §1)</span>
           <input type="number" style={{ ...inp, width: "58px", fontSize: "14px", fontWeight: "700" }}
             min={lpMinD} step={1} value={lpD}
             onChange={e => {
               if (sec0) onUpdateSection(sec0.id, { depthIn: Math.max(lpMinD, Number(e.target.value)) });
             }} />
-          <div style={{ fontSize: "10px", color: lpHasD ? "#b08020" : "#aaa" }}>
-            {lpHasD ? `min 16" (drawers)` : `min 12"`}
+          <div style={{ fontSize: "10px", color: lpMinD > 12 ? "#b08020" : "#aaa" }}>
+            {`min ${lpMinD}"`}
           </div>
         </div>
         <p style={{ fontSize: "11px", color: "#aaa", margin: "0" }}>
@@ -1517,8 +1767,7 @@ function Inspector({
     const rpH        = Math.min(run.rightPanelHeightIn ?? sysH, rpMaxH);
     const rpOpenSpc  = rpMaxH - rpH;
     const secN       = run.sections[run.sections.length - 1];
-    const rpHasD     = secN?.comps.some(c => c.type === "DrawerStack") ?? false;
-    const rpMinD     = rpHasD ? 16 : 12;
+    const rpMinD     = secN ? sectionMinDepth(secN) : 12;
     const rpD        = secN?.depthIn ?? 12;
     return (
       <div style={{ padding: "16px" }}>
@@ -1566,16 +1815,16 @@ function Inspector({
           </div>
         </div>
 
-        <div style={{ padding: "10px 12px", backgroundColor: rpHasD ? "#fffbf0" : "#faf8f5",
-          borderRadius: "6px", border: `1px solid ${rpHasD ? "#e8c870" : "#e8e4de"}`, marginBottom: "14px" }}>
+        <div style={{ padding: "10px 12px", backgroundColor: rpMinD > 12 ? "#fffbf0" : "#faf8f5",
+          borderRadius: "6px", border: `1px solid ${rpMinD > 12 ? "#e8c870" : "#e8e4de"}`, marginBottom: "14px" }}>
           <span style={lbl}>Depth (sets last §)</span>
           <input type="number" style={{ ...inp, width: "58px", fontSize: "14px", fontWeight: "700" }}
             min={rpMinD} step={1} value={rpD}
             onChange={e => {
               if (secN) onUpdateSection(secN.id, { depthIn: Math.max(rpMinD, Number(e.target.value)) });
             }} />
-          <div style={{ fontSize: "10px", color: rpHasD ? "#b08020" : "#aaa" }}>
-            {rpHasD ? `min 16" (drawers)` : `min 12"`}
+          <div style={{ fontSize: "10px", color: rpMinD > 12 ? "#b08020" : "#aaa" }}>
+            {`min ${rpMinD}"`}
           </div>
         </div>
         <p style={{ fontSize: "11px", color: "#aaa", margin: "0" }}>
@@ -1687,20 +1936,56 @@ function Inspector({
           <div style={{ padding: "8px 10px", backgroundColor: drawerTooWide ? "#fef2f2" : "#faf8f5",
             borderRadius: "6px", border: `1px solid ${drawerTooWide ? "#dc2626" : "#e8e4de"}` }}>
             <span style={lbl}>Width</span>
-            <div style={{ fontSize: "16px", fontWeight: "700", color: drawerTooWide ? "#dc2626" : "#333" }}>{sw.toFixed(1)}"</div>
-            <div style={{ fontSize: "10px", color: "#aaa" }}>set by panels</div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: "3px" }}>
+              <input
+                type="number"
+                min={MIN_SEC_W}
+                step={0.5}
+                value={widthDraft}
+                onChange={e => setWidthDraft(e.target.value)}
+                onBlur={() => {
+                  const v = parseFloat(widthDraft);
+                  if (!isNaN(v) && v > 0) onSetSectionWidth(si, v);
+                  // Sync display back to committed value after blur
+                  setWidthDraft(String(Math.round(secWidth(run!.panels, run!.startIn, run!.endIn, si) * 10) / 10));
+                }}
+                onKeyDown={e => {
+                  if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  if (e.key === "Escape") {
+                    setWidthDraft(String(Math.round(sw * 10) / 10));
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+                style={{
+                  ...inp, width: "58px", fontSize: "14px", fontWeight: "700",
+                  color: drawerTooWide ? "#dc2626" : "#333",
+                  backgroundColor: drawerTooWide ? "#fef2f2" : "#fff",
+                }}
+              />
+              <span style={{ fontSize: "12px", color: "#aaa" }}>"</span>
+            </div>
+            <div style={{ fontSize: "10px", color: "#aaa", marginTop: "2px" }}>
+              {run.panels.length === 0 ? "drag endpoints to resize" : "Enter or Tab to apply"}
+            </div>
           </div>
           {(() => {
-            const minD = hasDrawers ? 16 : 12;
+            const minD   = sectionMinDepth(sec);
+            const hasDoor = sec.comps.some(c => c.type === "Door");
+            const depthWarning = hasDoor
+              ? minD === 24 ? `min 24" (rod behind door)`
+              : minD === 22 ? `min 22" (drawers behind door)`
+              : `min 16" (door)`
+              : hasDrawers ? `min 16" (drawers)` : `min 12"`;
+            const depthHighlight = minD > 12;
             return (
-              <div style={{ padding: "8px 10px", backgroundColor: hasDrawers ? "#fffbf0" : "#faf8f5",
-                borderRadius: "6px", border: `1px solid ${hasDrawers ? "#e8c870" : "#e8e4de"}` }}>
+              <div style={{ padding: "8px 10px", backgroundColor: depthHighlight ? "#fffbf0" : "#faf8f5",
+                borderRadius: "6px", border: `1px solid ${depthHighlight ? "#e8c870" : "#e8e4de"}` }}>
                 <span style={lbl}>Depth</span>
                 <input type="number" style={{ ...inp, width: "58px", fontSize: "14px", fontWeight: "700" }}
                   min={minD} step={1} value={sec.depthIn}
                   onChange={e => onUpdateSection(sec.id, { depthIn: Number(e.target.value) })} />
-                <div style={{ fontSize: "10px", color: hasDrawers ? "#b08020" : "#aaa" }}>
-                  {hasDrawers ? `min 16" (drawers)` : `min 12"`}
+                <div style={{ fontSize: "10px", color: depthHighlight ? "#b08020" : "#aaa" }}>
+                  {depthWarning}
                 </div>
               </div>
             );
@@ -1738,20 +2023,24 @@ function Inspector({
             Add Component
           </p>
           <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
-            {(["Shelf", "Rod", "DrawerStack"] as CompType[]).map(type => {
+            {(["Shelf", "Rod", "DrawerStack", "Door"] as CompType[]).map(type => {
               const blocked =
                 ((type === "Shelf" || type === "Rod") && sw > MAX_SPAN_IN) ||
-                (type === "DrawerStack" && sw > DRAWER_MAX_W);
+                (type === "DrawerStack" && sw > DRAWER_MAX_W) ||
+                (type === "Door" && sw > DOOR_MAX_SEC_W);
               const blockReason =
                 (type === "Shelf" || type === "Rod")
                   ? `Section must be ≤ ${MAX_SPAN_IN}" to add ${type}`
-                  : `Drawers require section width of ${DRAWER_MAX_W}" or less`;
+                  : type === "DrawerStack"
+                  ? `Drawers require section width of ${DRAWER_MAX_W}" or less`
+                  : `Door requires section width of ${DOOR_MAX_SEC_W}" or less (currently ${sw.toFixed(1)}")`;
+              const label = type === "DrawerStack" ? "Drawers" : type;
               return (
                 <button key={type} disabled={blocked}
                   style={{ ...rowBtn(), opacity: blocked ? 0.4 : 1, cursor: blocked ? "not-allowed" : "pointer" }}
                   onClick={() => !blocked && onAddComp(sec.id, type)}
                   title={blocked ? blockReason : undefined}>
-                  + {type === "DrawerStack" ? "Drawers" : type}
+                  + {label}
                 </button>
               );
             })}
@@ -1759,6 +2048,11 @@ function Inspector({
           {sw > DRAWER_MAX_W && (
             <p style={{ margin: "8px 0 0", fontSize: "10px", color: "#b07040", lineHeight: 1.4 }}>
               Drawers require section width of {DRAWER_MAX_W}" or less.
+            </p>
+          )}
+          {sw > DOOR_MAX_SEC_W && (
+            <p style={{ margin: "6px 0 0", fontSize: "10px", color: "#5a80a8", lineHeight: 1.4 }}>
+              Door requires section ≤ {DOOR_MAX_SEC_W}" wide. Split section to add a door.
             </p>
           )}
         </div>
@@ -1924,7 +2218,7 @@ function CompCard({ comp, sec, secEffH, secWidthIn, onUpdate, onDelete }: {
     border: "1px solid #c8c4be", borderRadius: "4px",
     backgroundColor: "#fff", color: "#444", lineHeight: 1.4,
   };
-  const dotColor: Record<CompType, string> = { Shelf: C_SHELF, Rod: C_ROD, DrawerStack: C_DRAWER };
+  const dotColor: Record<CompType, string> = { Shelf: C_SHELF, Rod: C_ROD, DrawerStack: C_DRAWER, Door: C_DOOR_BD };
   const cH       = compHeight(comp);
   const top      = comp.positionIn + cH;
   const atLimit  = comp.type === "DrawerStack" && top >= DRAWER_MAX_TOP - 1;
@@ -1968,7 +2262,7 @@ function CompCard({ comp, sec, secEffH, secWidthIn, onUpdate, onDelete }: {
         </div>
       )}
 
-      <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: comp.type === "DrawerStack" ? "8px" : "0" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: (comp.type === "DrawerStack" || comp.type === "Door") ? "8px" : "0" }}>
         <span style={{ fontSize: "11px", color: "#888", width: isLocked ? "52px" : "30px" }}>
           {isLocked ? "Floor ↕" : "Pos"}
         </span>
@@ -2016,6 +2310,70 @@ function CompCard({ comp, sec, secEffH, secWidthIn, onUpdate, onDelete }: {
           </button>
         </div>
       )}
+
+      {comp.type === "Door" && (() => {
+        const dh       = comp.doorHeightIn ?? DOOR_DEFAULT_H;
+        const flipped  = comp.doorFlipped  ?? false;
+        // Door top = positionIn + doorHeight; must not exceed section effH (top lock boundary)
+        const maxDoorH = Math.min(DOOR_MAX_H_IN, sysH - comp.positionIn);
+        const atTopCap = dh >= maxDoorH - 1;
+        return (
+          <div style={{ paddingTop: "6px", borderTop: "1px solid #ede9e3" }}>
+            {/* Width — read-only, always equals section span */}
+            <div style={{ marginBottom: "6px", padding: "5px 8px", borderRadius: "4px",
+              backgroundColor: "#f0f4ff", border: "1px solid #c8d4f0",
+              fontSize: "11px", color: "#3b5bdb" }}>
+              Width: <strong>{secWidthIn?.toFixed(1) ?? "—"}"</strong>
+              <span style={{ color: "#7c8db5", marginLeft: "6px" }}>panel-to-panel (auto)</span>
+            </div>
+            {/* Height input — capped at section effH */}
+            <div style={{ display: "flex", alignItems: "center", gap: "5px", marginBottom: "6px" }}>
+              <span style={{ fontSize: "11px", color: "#888", width: "52px" }}>Height</span>
+              <input type="number" style={{ ...inp, width: "50px",
+                borderColor: atTopCap ? "#e08070" : "#c8c4be" }}
+                min={6} max={maxDoorH} step={1} value={dh}
+                onChange={e => {
+                  const v = Math.max(6, Math.min(maxDoorH, Number(e.target.value)));
+                  onUpdate({ doorHeightIn: v });
+                }} />
+              <span style={{ fontSize: "11px", color: atTopCap ? "#c0392b" : "#aaa" }}>
+                ″ / {maxDoorH}" max
+              </span>
+            </div>
+            {atTopCap && (
+              <div style={{ marginBottom: "6px", padding: "4px 7px", borderRadius: "4px",
+                backgroundColor: "#fef2f2", border: "1px solid #f0b8b0",
+                fontSize: "10px", color: "#b03020" }}>
+                Door height at section top limit ({maxDoorH}").
+              </div>
+            )}
+            {/* Handle side toggle */}
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <span style={{ fontSize: "11px", color: "#888", width: "52px" }}>Handle</span>
+              <button
+                style={{ padding: "3px 10px", fontSize: "11px", cursor: "pointer", borderRadius: "4px",
+                  border: `1.5px solid ${!flipped ? C_DOOR_BD : "#c8c4be"}`,
+                  backgroundColor: !flipped ? "#e8f0f8" : "#fff",
+                  color: !flipped ? C_DOOR_BD : "#666", fontWeight: !flipped ? "700" : "400" }}
+                onClick={() => onUpdate({ doorFlipped: false })}>
+                Right
+              </button>
+              <button
+                style={{ padding: "3px 10px", fontSize: "11px", cursor: "pointer", borderRadius: "4px",
+                  border: `1.5px solid ${flipped ? C_DOOR_BD : "#c8c4be"}`,
+                  backgroundColor: flipped ? "#e8f0f8" : "#fff",
+                  color: flipped ? C_DOOR_BD : "#666", fontWeight: flipped ? "700" : "400" }}
+                onClick={() => onUpdate({ doorFlipped: true })}>
+                Left
+              </button>
+              <span style={{ fontSize: "10px", color: "#aaa" }}>side</span>
+            </div>
+            <div style={{ marginTop: "5px", fontSize: "10px", color: "#9aabb8", lineHeight: 1.4 }}>
+              Flip handle to match adjacent doors — pair handles should face each other.
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -2030,12 +2388,13 @@ const TV_PAD_T  = 42;   // top padding (labels + system span bracket)
 const TV_PAD_B  = 28;   // bottom (section width labels)
 
 function WallTopView({
-  run, wall, cornerConstraints, zoom,
+  run, wall, cornerConstraints, zoom, flipped,
 }: {
   run:               WallRun;
   wall:              DesignWall;
   cornerConstraints: CornerConstraint[];
   zoom:              number;
+  flipped?:          boolean;
 }) {
   const wallW      = wall.widthIn;
   const wallCorns  = cornerConstraints.filter(c => c.wallId === wall.id);
@@ -2048,8 +2407,13 @@ function WallTopView({
   const svgW = TV_PAD_L + wallW * TV_SCALE + TV_PAD_R;
   const svgH = TV_PAD_T + maxDepth * TV_SCALE + TV_PAD_B;
 
-  const xPx = (xIn: number) => TV_PAD_L + xIn * TV_SCALE;
-  const yPx = (dIn: number) => TV_PAD_T + dIn * TV_SCALE;
+  /** Flip-aware x: data-space xIn → canvas pixel x. */
+  const xPx  = (xIn: number) =>
+    flipped ? TV_PAD_L + (wallW - xIn) * TV_SCALE : TV_PAD_L + xIn * TV_SCALE;
+  /** For a range [xL, xR] return [canvas_left_px, width_px]. */
+  const xRng = (xL: number, xR: number): [number, number] =>
+    [flipped ? TV_PAD_L + (wallW - xR) * TV_SCALE : TV_PAD_L + xL * TV_SCALE, (xR - xL) * TV_SCALE];
+  const yPx  = (dIn: number) => TV_PAD_T + dIn * TV_SCALE;
 
   // Section geometry (reuse shared helpers)
   const sLeft  = (i: number) => secLeft(run.panels, run.startIn, i);
@@ -2086,39 +2450,40 @@ function WallTopView({
         depth →
       </text>
 
-      {/* ── Corner clearance zones ── */}
+      {/* ── Corner clearance zones — use displaySide for correct visual position ── */}
       {wallCorns.map(cc => {
-        const zonePx  = cc.cutbackIn * TV_SCALE;
+        const zonePx   = cc.cutbackIn * TV_SCALE;
         const violated = cc.violated;
-        const fill    = violated ? "#fee2e2" : "#fff7ed";
-        const stroke  = violated ? "#dc2626" : "#f97316";
-        if (cc.side === "left") {
-          const w = Math.min(zonePx, wallW * TV_SCALE);
+        const fill     = violated ? "#fee2e2" : "#fff7ed";
+        const stroke   = violated ? "#dc2626" : "#f97316";
+        if (cc.displaySide === "left") {
+          const rectX = TV_PAD_L;
+          const rectW = Math.min(zonePx, wallW * TV_SCALE);
           return (
             <g key={cc.cornerKey} pointerEvents="none">
-              <rect x={xPx(0)} y={yPx(0)} width={w} height={maxDepth * TV_SCALE}
+              <rect x={rectX} y={yPx(0)} width={rectW} height={maxDepth * TV_SCALE}
                 fill={fill} opacity={0.65} />
-              <line x1={xPx(0) + w} y1={yPx(0)} x2={xPx(0) + w} y2={yPx(maxDepth)}
+              <line x1={rectX + rectW} y1={yPx(0)} x2={rectX + rectW} y2={yPx(maxDepth)}
                 stroke={stroke} strokeWidth={1.5} strokeDasharray="5,3" />
-              <text x={xPx(0) + w / 2} y={yPx(maxDepth / 2) + 4}
+              <text x={rectX + rectW / 2} y={yPx(maxDepth / 2) + 4}
                 textAnchor="middle" fontSize={8} fill={stroke} fontWeight="700"
-                transform={`rotate(-90,${xPx(0) + w / 2},${yPx(maxDepth / 2)})`}>
+                transform={`rotate(-90,${rectX + rectW / 2},${yPx(maxDepth / 2)})`}>
                 {cc.cutbackIn}" clear
               </text>
             </g>
           );
         } else {
-          const startX = xPx(wallW - cc.cutbackIn);
-          const w = cc.cutbackIn * TV_SCALE;
+          const rectX = TV_PAD_L + wallW * TV_SCALE - zonePx;
+          const rectW = zonePx;
           return (
             <g key={cc.cornerKey} pointerEvents="none">
-              <rect x={startX} y={yPx(0)} width={w} height={maxDepth * TV_SCALE}
+              <rect x={rectX} y={yPx(0)} width={rectW} height={maxDepth * TV_SCALE}
                 fill={fill} opacity={0.65} />
-              <line x1={startX} y1={yPx(0)} x2={startX} y2={yPx(maxDepth)}
+              <line x1={rectX} y1={yPx(0)} x2={rectX} y2={yPx(maxDepth)}
                 stroke={stroke} strokeWidth={1.5} strokeDasharray="5,3" />
-              <text x={startX + w / 2} y={yPx(maxDepth / 2) + 4}
+              <text x={rectX + rectW / 2} y={yPx(maxDepth / 2) + 4}
                 textAnchor="middle" fontSize={8} fill={stroke} fontWeight="700"
-                transform={`rotate(-90,${startX + w / 2},${yPx(maxDepth / 2)})`}>
+                transform={`rotate(-90,${rectX + rectW / 2},${yPx(maxDepth / 2)})`}>
                 {cc.cutbackIn}" clear
               </text>
             </g>
@@ -2127,39 +2492,45 @@ function WallTopView({
       })}
 
       {/* ── Gap zones ── */}
-      {run.startIn > 0.5 && (
-        <g pointerEvents="none">
-          <rect x={xPx(0)} y={yPx(0)} width={run.startIn * TV_SCALE} height={maxDepth * TV_SCALE}
-            fill="rgba(160,160,160,0.14)" />
-          <text x={xPx(run.startIn / 2)} y={yPx(maxDepth / 2) + 4}
-            textAnchor="middle" fontSize={9} fill="#aaa"
-            transform={`rotate(-90,${xPx(run.startIn / 2)},${yPx(maxDepth / 2)})`}>
-            {run.startIn.toFixed(1)}" gap
-          </text>
-        </g>
-      )}
-      {wallW - run.endIn > 0.5 && (
-        <g pointerEvents="none">
-          <rect x={xPx(run.endIn)} y={yPx(0)}
-            width={(wallW - run.endIn) * TV_SCALE} height={maxDepth * TV_SCALE}
-            fill="rgba(160,160,160,0.14)" />
-          <text
-            x={xPx(run.endIn + (wallW - run.endIn) / 2)}
-            y={yPx(maxDepth / 2) + 4}
-            textAnchor="middle" fontSize={9} fill="#aaa"
-            transform={`rotate(-90,${xPx(run.endIn + (wallW - run.endIn) / 2)},${yPx(maxDepth / 2)})`}>
-            {(wallW - run.endIn).toFixed(1)}" gap
-          </text>
-        </g>
-      )}
+      {run.startIn > 0.5 && (() => {
+        const [gx, gw] = xRng(0, run.startIn);
+        return (
+          <g pointerEvents="none">
+            <rect x={gx} y={yPx(0)} width={gw} height={maxDepth * TV_SCALE}
+              fill="rgba(160,160,160,0.14)" />
+            <text x={xPx(run.startIn / 2)} y={yPx(maxDepth / 2) + 4}
+              textAnchor="middle" fontSize={9} fill="#aaa"
+              transform={`rotate(-90,${xPx(run.startIn / 2)},${yPx(maxDepth / 2)})`}>
+              {run.startIn.toFixed(1)}" gap
+            </text>
+          </g>
+        );
+      })()}
+      {wallW - run.endIn > 0.5 && (() => {
+        const [gx, gw] = xRng(run.endIn, wallW);
+        return (
+          <g pointerEvents="none">
+            <rect x={gx} y={yPx(0)} width={gw} height={maxDepth * TV_SCALE}
+              fill="rgba(160,160,160,0.14)" />
+            <text
+              x={xPx(run.endIn + (wallW - run.endIn) / 2)}
+              y={yPx(maxDepth / 2) + 4}
+              textAnchor="middle" fontSize={9} fill="#aaa"
+              transform={`rotate(-90,${xPx(run.endIn + (wallW - run.endIn) / 2)},${yPx(maxDepth / 2)})`}>
+              {(wallW - run.endIn).toFixed(1)}" gap
+            </text>
+          </g>
+        );
+      })()}
 
       {/* ── Section fills (per section, actual depth) ── */}
       {run.sections.map((sec, si) => {
-        const lx = sLeft(si);
-        const sw = sWidth(si);
+        const lx       = sLeft(si);
+        const sw       = sWidth(si);
+        const [rx, rw] = xRng(lx, lx + sw);
         return (
           <g key={sec.id} pointerEvents="none">
-            <rect x={xPx(lx)} y={yPx(0)} width={sw * TV_SCALE} height={sec.depthIn * TV_SCALE}
+            <rect x={rx} y={yPx(0)} width={rw} height={sec.depthIn * TV_SCALE}
               fill="rgba(195,155,100,0.30)" stroke="#c4935a" strokeWidth={0.75} />
             {/* Depth value inside section */}
             <text x={xPx(lx + sw / 2)} y={yPx(sec.depthIn / 2) + 4}
@@ -2175,10 +2546,11 @@ function WallTopView({
         const leftDepth  = run.sections[pi]?.depthIn     ?? maxDepth;
         const rightDepth = run.sections[pi + 1]?.depthIn ?? maxDepth;
         const pDepth     = Math.max(leftDepth, rightDepth);
+        const [px, pw]   = xRng(panel.xIn, panel.xIn + PANEL_W_IN);
         return (
           <rect key={panel.id}
-            x={xPx(panel.xIn)} y={yPx(0)}
-            width={PANEL_W_IN * TV_SCALE} height={pDepth * TV_SCALE}
+            x={px} y={yPx(0)}
+            width={pw} height={pDepth * TV_SCALE}
             fill="#b8956a" stroke="#8b6437" strokeWidth={0.5}
             pointerEvents="none"
           />
@@ -2187,31 +2559,61 @@ function WallTopView({
 
       {/* ── End panels ── */}
       {run.sections.length > 0 && (() => {
-        const d0 = run.sections[0].depthIn;
-        const dN = run.sections[run.sections.length - 1].depthIn;
+        const d0         = run.sections[0].depthIn;
+        const dN         = run.sections[run.sections.length - 1].depthIn;
+        const [lpx, lpw] = xRng(run.startIn, run.startIn + PANEL_W_IN);
+        const [rpx, rpw] = xRng(run.endIn - PANEL_W_IN, run.endIn);
         return (
           <>
-            <rect x={xPx(run.startIn)} y={yPx(0)}
-              width={PANEL_W_IN * TV_SCALE} height={d0 * TV_SCALE}
+            <rect x={lpx} y={yPx(0)}
+              width={lpw} height={d0 * TV_SCALE}
               fill="#b8956a" stroke="#8b6437" strokeWidth={1} pointerEvents="none" />
-            <rect x={xPx(run.endIn - PANEL_W_IN)} y={yPx(0)}
-              width={PANEL_W_IN * TV_SCALE} height={dN * TV_SCALE}
+            <rect x={rpx} y={yPx(0)}
+              width={rpw} height={dN * TV_SCALE}
               fill="#b8956a" stroke="#8b6437" strokeWidth={1} pointerEvents="none" />
           </>
         );
       })()}
 
+      {/* ── Panel depth labels (one per panel, rotated inside panel) ── */}
+      {run.sections.length > 0 && (() => {
+        const d0 = run.sections[0].depthIn;
+        const dN = run.sections[run.sections.length - 1].depthIn;
+        type PD = { cx: number; depth: number; key: string };
+        const items: PD[] = [];
+        items.push({ cx: xPx(run.startIn + PANEL_W_IN / 2), depth: d0, key: 'lep' });
+        run.panels.forEach((panel, pi) => {
+          const lD = run.sections[pi]?.depthIn ?? maxDepth;
+          const rD = run.sections[pi + 1]?.depthIn ?? maxDepth;
+          items.push({ cx: xPx(panel.xIn + PANEL_W_IN / 2), depth: Math.max(lD, rD), key: `ip${panel.id}` });
+        });
+        items.push({ cx: xPx(run.endIn - PANEL_W_IN / 2), depth: dN, key: 'rep' });
+        return items.map(({ cx, depth, key }) => {
+          const yMid = yPx(depth / 2);
+          return (
+            <text key={`pdlbl-${key}`}
+              x={cx} y={yMid}
+              textAnchor="middle" dominantBaseline="central"
+              fontSize={10} fill="#000" fontWeight="900"
+              stroke="#fff" strokeWidth={2.5} paintOrder="stroke"
+              transform={`rotate(-90,${cx},${yMid})`}
+              pointerEvents="none">
+              {depth}"
+            </text>
+          );
+        });
+      })()}
+
       {/* ── Obstacles (shown at wall face as position markers) ── */}
       {obstacles.map(obs => {
-        const xLeft = xPx(obs.xIn);
-        const wPx   = obs.wIn * TV_SCALE;
-        const fill  = OBS_FILL[obs.type];
-        const stroke= OBS_STROKE[obs.type];
+        const [ox, ow] = xRng(obs.xIn, obs.xIn + obs.wIn);
+        const fill     = OBS_FILL[obs.type];
+        const stroke   = OBS_STROKE[obs.type];
         return (
           <g key={obs.id} pointerEvents="none">
-            <rect x={xLeft} y={yPx(0) - 10} width={wPx} height={10}
+            <rect x={ox} y={yPx(0) - 10} width={ow} height={10}
               fill={fill} stroke={stroke} strokeWidth={1} rx={1} opacity={0.9} />
-            <text x={xLeft + wPx / 2} y={yPx(0) - 2}
+            <text x={ox + ow / 2} y={yPx(0) - 2}
               textAnchor="middle" fontSize={7} fill={stroke} fontWeight="700">
               {OBS_LABEL[obs.type]}
             </text>
@@ -2420,21 +2822,35 @@ function RoomTopView({
                 );
               })()}
               {(() => {
-                const maxD = Math.max(...run.sections.map(s => s.depthIn));
-                const midAlong = (run.startIn + run.endIn) / 2;
-                const [mx, my] = wallPt(segIdx, midAlong, fd(maxD / 2));
-                const [wx1, wy1] = segStart(segments, pts,segIdx);
-                const [wx2, wy2] = pts[segIdx+1] ?? pts[segIdx];
-                const wl = Math.sqrt((wx2-wx1)**2+(wy2-wy1)**2);
+                const [wx1, wy1] = segStart(segments, pts, segIdx);
+                const [wx2, wy2] = pts[segIdx + 1] ?? pts[segIdx];
+                const wl = Math.sqrt((wx2 - wx1) ** 2 + (wy2 - wy1) ** 2);
                 if (wl < 0.01) return null;
-                const depthAngle = (Math.atan2((wy2-wy1)/wl, (wx2-wx1)/wl) * 180/Math.PI) - 90;
-                return (
-                  <text x={mx} y={my} textAnchor="middle" dominantBaseline="middle"
-                    fontSize={9} fill="#8b6437" fontWeight="700" pointerEvents="none"
-                    transform={`rotate(${depthAngle.toFixed(1)},${mx.toFixed(1)},${my.toFixed(1)})`}>
-                    {maxD}"
-                  </text>
-                );
+                const depthAngle = (Math.atan2((wy2 - wy1) / wl, (wx2 - wx1) / wl) * 180 / Math.PI) - 90;
+                const d0 = run.sections[0].depthIn;
+                const dN = run.sections[run.sections.length - 1].depthIn;
+                type PD = { mid: number; depth: number; key: string };
+                const items: PD[] = [];
+                items.push({ mid: run.startIn + PANEL_W_IN / 2, depth: d0, key: 'lep' });
+                run.panels.forEach((panel, pi) => {
+                  const lD = run.sections[pi]?.depthIn ?? 12;
+                  const rD = run.sections[pi + 1]?.depthIn ?? 12;
+                  items.push({ mid: panel.xIn + PANEL_W_IN / 2, depth: Math.max(lD, rD), key: `ip${panel.id}` });
+                });
+                items.push({ mid: run.endIn - PANEL_W_IN / 2, depth: dN, key: 'rep' });
+                return items.map(({ mid, depth, key }) => {
+                  const [mx, my] = wallPt(segIdx, mid, fd(depth / 2));
+                  return (
+                    <text key={`pdlbl-${key}`}
+                      x={mx} y={my}
+                      textAnchor="middle" dominantBaseline="central"
+                      fontSize={10} fill="#000" fontWeight="900" pointerEvents="none"
+                      stroke="#fff" strokeWidth={2.5} paintOrder="stroke"
+                      transform={`rotate(${depthAngle.toFixed(1)},${mx.toFixed(1)},${my.toFixed(1)})`}>
+                      {depth}"
+                    </text>
+                  );
+                });
               })()}
             </g>
           );
@@ -2582,6 +2998,9 @@ export default function DesignPage() {
   const [topSubMode,      setTopSubMode]      = useState<"wall" | "room">("room");
   const [ready,           setReady]           = useState(false);
   const [designZoom,      setDesignZoom]      = useState(1.0);
+  const [savedProject,    setSavedProject]    = useState<Project | null>(null);
+  const [unsaved,         setUnsaved]         = useState(false);
+  const [saveFlash,       setSaveFlash]       = useState(false);
 
   const dragRef        = useRef<DragState | null>(null);
   const layoutRef      = useRef<RoomLayout | null>(null);
@@ -2639,6 +3058,18 @@ export default function DesignPage() {
       setRuns(newRuns);
       setFullLengthWalls(savedFullLengthWalls);
       if (usableWalls.length > 0) setActiveWallId(usableWalls[0].id);
+
+      // Load active project info for header
+      const activeId = getActiveProjectId();
+      if (activeId) {
+        const proj = getProject(activeId);
+        if (proj) { setSavedProject(proj); setUnsaved(false); }
+        else       { setSavedProject(null); setUnsaved(true); }
+      } else {
+        setSavedProject(null);
+        setUnsaved(localStorage.getItem("design-state") !== null || rawLayout !== null);
+      }
+
       setReady(true);
     } catch {
       router.replace("/room-layout");
@@ -2656,8 +3087,21 @@ export default function DesignPage() {
     saveTimer.current = setTimeout(() => {
       localStorage.setItem("design-state", JSON.stringify({ v: 2, runs, fullLengthWalls }));
       saveCompatPayload(layout, runs);
+      // Mark project as having unsaved changes after any design edit
+      setUnsaved(true);
     }, 300);
   }, [runs, fullLengthWalls, ready, layout]);
+
+  // ── Save project ───────────────────────────────────────────────────────────
+
+  function handleSaveProject() {
+    const activeId = getActiveProjectId();
+    const saved = saveCurrentProject(activeId);
+    setSavedProject(saved);
+    setUnsaved(false);
+    setSaveFlash(true);
+    setTimeout(() => setSaveFlash(false), 1800);
+  }
 
   // ── Drag system ────────────────────────────────────────────────────────────
 
@@ -2686,7 +3130,8 @@ export default function DesignPage() {
       }
 
       if (drag.kind === "panel") {
-        const rawX = drag.startXIn + (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
+        const sign = drag.flipped ? -1 : 1;
+        const rawX = drag.startXIn + sign * (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
         setRuns(prev => prev.map(r =>
           r.wallId === drag.wallId ? runMovePanel(r, drag.panelIdx, rawX) : r
         ));
@@ -2728,14 +3173,16 @@ export default function DesignPage() {
       }
 
       if (drag.kind === "left-end") {
-        const rawStart = drag.startIn + (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
+        const sign     = drag.flipped ? -1 : 1;
+        const rawStart = drag.startIn + sign * (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
         setRuns(prev => prev.map(r =>
           r.wallId === drag.wallId ? runMoveLeftEnd(r, rawStart) : r
         ));
       }
 
       if (drag.kind === "right-end") {
-        const rawEnd = drag.endIn + (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
+        const sign   = drag.flipped ? -1 : 1;
+        const rawEnd = drag.endIn + sign * (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
         const wallW  = layoutRef.current
           ? (getSelectedWalls(layoutRef.current).find(w => w.id === drag.wallId)?.widthIn ?? 120)
           : 120;
@@ -2745,7 +3192,8 @@ export default function DesignPage() {
       }
 
       if (drag.kind === "obstacle") {
-        const rawX = drag.startXIn + (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
+        const sign = drag.flipped ? -1 : 1;
+        const rawX = drag.startXIn + sign * (e.clientX - drag.startX) / (SCALE * designZoomRef.current);
         const rawY = drag.startYIn - (e.clientY - drag.startY) / (SCALE * designZoomRef.current);
         setRuns(prev => {
           const run = prev.find(r => r.wallId === drag.wallId);
@@ -2790,6 +3238,8 @@ export default function DesignPage() {
   const wLabel            = (wallId: string) => wallLabelMap.get(wallId) ?? wallId;
   const activeWall        = usableWalls.find(w => w.id === activeWallId) ?? null;
   const activeRun         = runs.find(r => r.wallId === activeWallId) ?? null;
+  const activeSegment     = layout?.segments?.find(s => s.id === activeWallId) ?? null;
+  const activeFlipped     = activeSegment?.footprintFlipped ?? false;
   const sysH              = layout?.systemHeightIn ?? 84;
   const cornerConstraints = layout ? deriveConstraints(fullLengthWalls, runs, usableWalls, layout, wLabel) : [];
   const anyViolations     = cornerConstraints.some(c => c.violated);
@@ -2818,11 +3268,19 @@ export default function DesignPage() {
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
           <span style={{ fontSize: "15px", fontWeight: "800" }}>Design Editor</span>
-          {layout.projectType && (
-            <span style={{ fontSize: "11px", color: "#aaa", backgroundColor: "#333",
-              borderRadius: "4px", padding: "2px 8px" }}>{layout.projectType}</span>
+          {savedProject ? (
+            <span style={{ fontSize: "12px", color: "#aaa" }}>
+              {projectDisplayName(savedProject)}
+            </span>
+          ) : (
+            <>
+              {layout.projectType && (
+                <span style={{ fontSize: "11px", color: "#aaa", backgroundColor: "#333",
+                  borderRadius: "4px", padding: "2px 8px" }}>{layout.projectType}</span>
+              )}
+              {layout.clientName && <span style={{ fontSize: "12px", color: "#aaa" }}>{layout.clientName}</span>}
+            </>
           )}
-          {layout.clientName && <span style={{ fontSize: "12px", color: "#aaa" }}>{layout.clientName}</span>}
         </div>
         <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
           {["Setup", "Room Layout", "Design", "Worksheet"].map((s, i) => (
@@ -2832,13 +3290,33 @@ export default function DesignPage() {
               color: i === 2 ? "#1a1a1a" : "#888", fontWeight: i === 2 ? "700" : "400",
             }}>{s}</span>
           ))}
-          <button onClick={() => router.push("/room-layout")}
+          <button onClick={() => router.push("/")}
             style={{
               fontSize: "12px", fontWeight: "600", cursor: "pointer", marginLeft: "8px",
+              padding: "5px 14px", borderRadius: "6px",
+              border: "1.5px solid #4a4a4a", backgroundColor: "transparent", color: "#aaa",
+            }}>
+            Dashboard
+          </button>
+          <button onClick={() => router.push("/room-layout")}
+            style={{
+              fontSize: "12px", fontWeight: "600", cursor: "pointer",
               padding: "5px 14px", borderRadius: "6px",
               border: "1.5px solid #4a4a4a", backgroundColor: "transparent", color: "#ddd",
             }}>
             ← Room Layout
+          </button>
+          {/* Save button */}
+          <button
+            onClick={handleSaveProject}
+            style={{
+              fontSize: "12px", fontWeight: "700", cursor: "pointer",
+              padding: "5px 14px", borderRadius: "6px", border: "none",
+              backgroundColor: saveFlash ? "#27ae60" : unsaved ? "#f0a500" : "#3a5a3a",
+              color: "#fff", transition: "background-color 0.3s",
+              display: "flex", alignItems: "center", gap: "5px",
+            }}>
+            {saveFlash ? "✓ Saved" : unsaved ? "● Save" : "✓ Saved"}
           </button>
         </div>
       </header>
@@ -2982,6 +3460,7 @@ export default function DesignPage() {
                       }}
                       cornerConstraints={cornerConstraints}
                       zoom={designZoom}
+                      flipped={activeFlipped}
                     />
                   </div>
                   {/* Front view legend */}
@@ -3066,6 +3545,7 @@ export default function DesignPage() {
                             wall={activeWall}
                             cornerConstraints={cornerConstraints}
                             zoom={designZoom}
+                            flipped={activeFlipped}
                           />
                         </div>
                         <div style={{ marginTop: "10px", display: "flex", gap: "14px",
@@ -3178,6 +3658,9 @@ export default function DesignPage() {
               sysH={sysH} ceilingH={layout.ceilingHeightIn ?? 96}
               onUpdateSection={(secId, u) => {
                 if (activeWallId) patchRun(activeWallId, r => runUpdateSection(r, secId, u));
+              }}
+              onSetSectionWidth={(si, w) => {
+                if (activeWallId) patchRun(activeWallId, r => runSetSectionWidth(r, si, w, activeWall?.widthIn));
               }}
               onAddComp={(secId, type) => {
                 if (activeWallId) patchRun(activeWallId, r => runAddComp(r, secId, type, sysH));

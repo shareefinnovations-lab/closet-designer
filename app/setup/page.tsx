@@ -1,83 +1,66 @@
 "use client";
 // app/setup/page.tsx
 //
-// Standalone setup page. Collects client info + dimensions + remarks,
-// saves to localStorage["closet-setup"], generates a starter layout
-// from remarks, saves it to localStorage["closet-design"], then
-// navigates to /elevation.
+// Project Setup — collects client/project info only.
+// Room geometry (dimensions, segments) is built in Room Layout.
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import type { Config } from "@/app/elevation/_lib/types";
+import { getActiveProjectId, saveCurrentProject } from "@/app/_lib/projects";
 
 const STORAGE_KEY = "closet-setup";
+
+const PROJECT_TYPES = [
+  "Reach-In Closet",
+  "Walk-In Closet",
+  "Garage",
+  "Wall Bed",
+  "Office",
+];
 
 export default function SetupPage() {
   const router = useRouter();
 
-  const [clientName,      setClientName]      = useState("");
-  const [clientNum,       setClientNum]       = useState("");
-  const [locationName,    setLocationName]    = useState("");
-  const [wallWidthIn,     setWallWidthIn]     = useState(66);
-  const [ceilingHeightIn, setCeilingHeightIn] = useState(101);
-  const [closetDepthIn,   setClosetDepthIn]   = useState(25);
-  const [leftReturnIn,    setLeftReturnIn]    = useState(0.5);
-  const [rightReturnIn,   setRightReturnIn]   = useState(2.5);
-  const [remarks,         setRemarks]         = useState("");
-  const [projectType,     setProjectType]     = useState("");
+  const [clientName,   setClientName]   = useState("");
+  const [clientNum,    setClientNum]    = useState("");
+  const [locationName, setLocationName] = useState("");
+  const [projectType,  setProjectType]  = useState("");
+  const [remarks,      setRemarks]      = useState("");
 
-  // Pre-fill from saved setup (returning to edit) or from dashboard session
+  // Pre-fill from saved setup or from dashboard session
   useEffect(() => {
-    // 1. Try restoring a previous full setup
     const rawSetup = localStorage.getItem(STORAGE_KEY);
     if (rawSetup) {
       try {
-        const saved = JSON.parse(rawSetup) as Config;
-        setClientName(saved.clientName           ?? "");
-        setClientNum(saved.clientNum             ?? "");
-        setLocationName(saved.locationName       ?? "");
-        setWallWidthIn(saved.wallWidthIn         ?? 66);
-        setCeilingHeightIn(saved.ceilingHeightIn ?? 101);
-        setClosetDepthIn(saved.closetDepthIn     ?? 25);
-        setLeftReturnIn(saved.leftReturnIn       ?? 0.5);
-        setRightReturnIn(saved.rightReturnIn     ?? 2.5);
-        setRemarks(saved.remarks                 ?? "");
-        setProjectType(saved.projectType         ?? "");
+        const saved = JSON.parse(rawSetup);
+        setClientName(saved.clientName    ?? "");
+        setClientNum(saved.clientNum      ?? "");
+        setLocationName(saved.locationName ?? "");
+        setProjectType(saved.projectType  ?? "");
+        setRemarks(saved.remarks          ?? "");
         return;
       } catch { /* ignore corrupt data */ }
     }
 
-    // 2. No full setup yet — check if dashboard wrote a session (clientNum + projectType)
+    // No full setup — check for dashboard session (clientNum + clientName + projectType)
     const rawSession = localStorage.getItem("closet-session");
     if (rawSession) {
       try {
-        const session = JSON.parse(rawSession) as { clientNum?: string; projectType?: string };
+        const session = JSON.parse(rawSession) as { clientNum?: string; clientName?: string; projectType?: string };
         if (session.clientNum)   setClientNum(session.clientNum);
+        if (session.clientName)  setClientName(session.clientName);
         if (session.projectType) setProjectType(session.projectType);
       } catch { /* ignore */ }
     }
   }, []);
 
-  const canStart = wallWidthIn > 0 && ceilingHeightIn > 0 && closetDepthIn > 0;
-
-  function handleStart() {
-    if (!canStart) return;
-
-    const config: Config = {
-      clientName, clientNum, locationName,
-      wallWidthIn, ceilingHeightIn, closetDepthIn,
-      leftReturnIn, rightReturnIn, remarks,
-      projectType: projectType || undefined,
-    };
-    // Clear the temporary dashboard session now that the full config is saved
+  function handleContinue() {
+    const config = { clientName, clientNum, locationName, projectType: projectType || undefined, remarks };
     localStorage.removeItem("closet-session");
-
-    // Save setup — Room Layout Builder reads from this key
     localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
-    // Clear any stale design state so the new flow starts fresh
+    // Clear stale geometry so Room Layout starts fresh
     localStorage.removeItem("room-layout");
     localStorage.removeItem("design-state");
-
     router.push("/room-layout");
   }
 
@@ -102,33 +85,47 @@ export default function SetupPage() {
   const grid2: React.CSSProperties = { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "14px" };
 
   return (
-    <div style={{ fontFamily: "sans-serif", minHeight: "100vh", backgroundColor: "#f5f2ee", display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 24px" }}>
+    <div style={{ fontFamily: "sans-serif", minHeight: "100vh", backgroundColor: "#f5f2ee",
+      display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "60px 24px" }}>
       <style>{`.setup-input::placeholder { color: #999; }`}</style>
       <div style={{ width: "100%", maxWidth: "540px" }}>
 
-        {/* Back link */}
-        <button onClick={() => router.push("/")} style={{
-          fontSize: "12px", fontWeight: "600", color: "#888", background: "none",
-          border: "none", cursor: "pointer", padding: "0 0 20px", display: "flex", alignItems: "center", gap: "4px",
-        }}>
-          ← Dashboard
-        </button>
+        {/* Back link + Save */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: "20px" }}>
+          <button onClick={() => router.push("/")} style={{
+            fontSize: "12px", fontWeight: "600", color: "#888", background: "none",
+            border: "none", cursor: "pointer", display: "flex", alignItems: "center", gap: "4px",
+          }}>
+            ← Dashboard
+          </button>
+          <button onClick={() => {
+            const config = { clientName, clientNum, locationName, projectType: projectType || undefined, remarks };
+            localStorage.setItem("closet-setup", JSON.stringify(config));
+            saveCurrentProject(getActiveProjectId());
+          }} style={{
+            fontSize: "12px", fontWeight: "700", color: "#fff", backgroundColor: "#3a5a3a",
+            border: "none", borderRadius: "6px", cursor: "pointer", padding: "6px 16px",
+          }}>
+            Save
+          </button>
+        </div>
 
         <div style={{ display: "flex", alignItems: "baseline", gap: "10px", marginBottom: "4px" }}>
           <h1 style={{ fontSize: "26px", fontWeight: "800", color: "#1a1a1a", margin: 0 }}>
             Project Setup
           </h1>
           {projectType && (
-            <span style={{ fontSize: "13px", fontWeight: "600", color: "#fff", backgroundColor: "#1a1a1a", borderRadius: "5px", padding: "2px 9px" }}>
+            <span style={{ fontSize: "13px", fontWeight: "600", color: "#fff",
+              backgroundColor: "#1a1a1a", borderRadius: "5px", padding: "2px 9px" }}>
               {projectType}
             </span>
           )}
         </div>
         <p style={{ fontSize: "14px", color: "#888", marginTop: "4px", marginBottom: "32px" }}>
-          Enter client details and closet dimensions to generate a starter layout.
+          Enter client and project details. You&apos;ll set room dimensions in the next step.
         </p>
 
-        {/* ── Client Info ─────────────────────────────────────────────────── */}
+        {/* ── Client Information ───────────────────────────────────────────── */}
         <div style={card}>
           <p style={cardTitle}>Client Information</p>
           <div style={grid2}>
@@ -144,48 +141,30 @@ export default function SetupPage() {
             </div>
             <div style={{ ...fieldRow, gridColumn: "1 / -1" }}>
               <label style={label}>Location / Room Name</label>
-              <input style={input} className="setup-input" type="text" placeholder="e.g. Master Bedroom, Walk-in"
+              <input style={input} className="setup-input" type="text"
+                placeholder="e.g. Master Bedroom, Walk-in"
                 value={locationName} onChange={e => setLocationName(e.target.value)} />
             </div>
           </div>
         </div>
 
-        {/* ── Dimensions ──────────────────────────────────────────────────── */}
+        {/* ── Project Type ─────────────────────────────────────────────────── */}
         <div style={card}>
-          <p style={cardTitle}>Closet Dimensions</p>
-          <div style={grid2}>
-            <div style={fieldRow}>
-              <label style={label}>Wall Width (in) *</label>
-              <input style={input} className="setup-input" type="number" min={12} value={wallWidthIn}
-                onChange={e => setWallWidthIn(Number(e.target.value))} />
-            </div>
-            <div style={fieldRow}>
-              <label style={label}>Ceiling Height (in) *</label>
-              <input style={input} className="setup-input" type="number" min={48} value={ceilingHeightIn}
-                onChange={e => setCeilingHeightIn(Number(e.target.value))} />
-            </div>
-            <div style={fieldRow}>
-              <label style={label}>Closet Depth (in) *</label>
-              <input style={input} className="setup-input" type="number" min={12} value={closetDepthIn}
-                onChange={e => setClosetDepthIn(Number(e.target.value))} />
-            </div>
-          </div>
-        </div>
-
-        {/* ── Return Walls ────────────────────────────────────────────────── */}
-        <div style={card}>
-          <p style={cardTitle}>Return Walls</p>
-          <div style={grid2}>
-            <div style={fieldRow}>
-              <label style={label}>Left Return Wall — LRW (in)</label>
-              <input style={input} className="setup-input" type="number" min={0} step={0.25} value={leftReturnIn}
-                onChange={e => setLeftReturnIn(Number(e.target.value))} />
-            </div>
-            <div style={fieldRow}>
-              <label style={label}>Right Return Wall — RRW (in)</label>
-              <input style={input} className="setup-input" type="number" min={0} step={0.25} value={rightReturnIn}
-                onChange={e => setRightReturnIn(Number(e.target.value))} />
-            </div>
+          <p style={cardTitle}>Project Type</p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+            {PROJECT_TYPES.map(t => (
+              <button key={t} onClick={() => setProjectType(projectType === t ? "" : t)}
+                style={{
+                  padding: "7px 16px", fontSize: "13px", fontWeight: "600",
+                  borderRadius: "20px", border: "1.5px solid",
+                  backgroundColor: projectType === t ? "#1a1a1a" : "#fff",
+                  borderColor:     projectType === t ? "#1a1a1a" : "#c8c4be",
+                  color:           projectType === t ? "#fff" : "#444",
+                  cursor: "pointer",
+                }}>
+                {t}
+              </button>
+            ))}
           </div>
         </div>
 
@@ -193,43 +172,29 @@ export default function SetupPage() {
         <div style={card}>
           <p style={cardTitle}>Remarks / Client Needs</p>
           <div style={fieldRow}>
-            <label style={label}>What does the client need? (optional)</label>
+            <label style={label}>Notes about the client&apos;s needs (optional)</label>
             <textarea
               className="setup-input"
-              placeholder="e.g. Lots of hanging space for dresses and suits. Some drawers for folded clothes. Shoe shelf on the right side."
+              placeholder="e.g. Lots of hanging space for dresses and suits. Some drawers for folded clothes."
               value={remarks}
               onChange={e => setRemarks(e.target.value)}
               rows={4}
-              style={{
-                ...input,
-                resize: "vertical",
-                lineHeight: "1.5",
-                fontFamily: "sans-serif",
-              }}
+              style={{ ...input, resize: "vertical", lineHeight: "1.5", fontFamily: "sans-serif" }}
             />
-            <span style={{ fontSize: "11px", color: "#aaa", marginTop: "4px" }}>
-              Notes about the client's needs — used to set up the room layout.
-            </span>
           </div>
         </div>
 
         {/* ── Submit ──────────────────────────────────────────────────────── */}
         <button
-          onClick={handleStart}
-          disabled={!canStart}
+          onClick={handleContinue}
           style={{
             width: "100%", padding: "14px", fontSize: "15px", fontWeight: "700",
-            backgroundColor: canStart ? "#1a1a1a" : "#c5c0b8",
-            color: "#fff", border: "none", borderRadius: "8px",
-            cursor: canStart ? "pointer" : "default",
-            letterSpacing: "0.3px",
+            backgroundColor: "#1a1a1a", color: "#fff", border: "none",
+            borderRadius: "8px", cursor: "pointer", letterSpacing: "0.3px",
           }}
         >
           Continue to Room Layout →
         </button>
-        <p style={{ fontSize: "12px", color: "#bbb", textAlign: "center", marginTop: "12px" }}>
-          * Required fields
-        </p>
 
       </div>
     </div>

@@ -16,9 +16,11 @@ export const PANEL_W_IN = 0.75;
 
 export interface StoredComp {
   id:            number;
-  type:          "Shelf" | "Rod" | "DrawerStack";
+  type:          "Shelf" | "Rod" | "DrawerStack" | "Door";
   positionIn:    number;
   drawerHeights: number[];
+  doorHeightIn?: number;
+  doorFlipped?:  boolean;
 }
 
 export interface StoredSection {
@@ -76,7 +78,12 @@ export function runToPricingSections(run: StoredRun): PricingSection[] {
   return run.sections.map((s, i) => ({
     widthIn:    secWidth(run.panels, run.startIn, run.endIn, i),
     depthIn:    s.depthIn,
-    components: s.comps.map(c => ({ type: c.type, drawerHeights: c.drawerHeights })),
+    components: s.comps.map(c => ({
+      type:          c.type,
+      drawerHeights: c.drawerHeights,
+      doorHeightIn:  c.doorHeightIn,
+      doorFlipped:   c.doorFlipped,
+    })),
   }));
 }
 
@@ -121,7 +128,8 @@ export function computeWallWorksheet(
   sysH:           number,
 ): WallWorksheetResult {
   const pricingSections = runToPricingSections(run);
-  const pricing         = computePricing(pricingSections, overallDepthIn);
+  const panelHeights    = runToPanelHeights(run, sysH);
+  const pricing         = computePricing(pricingSections, overallDepthIn, panelHeights);
 
   let shelfCount = 0, rodCount = 0, drawerCount = 0;
   for (const sec of pricingSections) {

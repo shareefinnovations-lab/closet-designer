@@ -83,9 +83,11 @@ export type SectionKind =
 
 export interface DesignComponent {
   id:            number;
-  type:          "Shelf" | "Rod" | "DrawerStack";
+  type:          "Shelf" | "Rod" | "DrawerStack" | "Door";
   positionIn:    number;
   drawerHeights: number[];
+  doorHeightIn?: number;
+  doorFlipped?:  boolean;
 }
 
 export interface DesignSection {

@@ -7,6 +7,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { getActiveProjectId, saveCurrentProject } from "@/app/_lib/projects";
 import { ADJUSTMENT_RATE } from "@/src/lib/pricing";
 import { computeWallWorksheet } from "@/src/lib/wall-pricing";
 import type { WallWorksheetResult, DesignStateV2 } from "@/src/lib/wall-pricing";
@@ -128,8 +129,15 @@ export default function WorksheetPage() {
             <p style={S.subtitle}>Internal use only</p>
           </div>
           <div style={{ display: "flex", gap: "10px" }}>
+            <button onClick={() => router.push("/")} style={S.btnBack}>
+              Dashboard
+            </button>
             <button onClick={() => router.push("/design")} style={S.btnBack}>
               ← Back to Design
+            </button>
+            <button onClick={() => { saveCurrentProject(getActiveProjectId()); }}
+              style={{ ...S.btnBack, backgroundColor: "#3a5a3a", color: "#fff", border: "none", fontWeight: "700" }}>
+              Save
             </button>
             <button onClick={() => router.push("/design-preview")} style={S.btnNext}>
               Design Preview →
@@ -280,21 +288,16 @@ export default function WorksheetPage() {
                 <td style={{ ...S.td, textAlign: "right", color: "#aaa" }}>—</td>
                 <td style={{ ...S.td, textAlign: "right", color: "#aaa", fontStyle: "italic", fontSize: "11px" }}>TBD</td>
               </tr>
-              <tr style={S.rowOdd}>
-                <td style={S.td}>Doors</td>
-                <td style={{ ...S.td, textAlign: "right", color: "#aaa" }}>—</td>
-                <td style={{ ...S.td, textAlign: "right", color: "#aaa" }}>—</td>
-                <td style={{ ...S.td, textAlign: "right", color: "#aaa", fontStyle: "italic", fontSize: "11px" }}>TBD</td>
-              </tr>
             </tbody>
           </table>
         </div>
 
         {/* ── Bottom nav ───────────────────────────────────────────────────── */}
         <div style={{ marginTop: "40px", display: "flex", justifyContent: "space-between" }}>
-          <button onClick={() => router.push("/design")} style={S.btnBack}>
-            ← Back to Design
-          </button>
+          <div style={{ display: "flex", gap: "10px" }}>
+            <button onClick={() => router.push("/")} style={S.btnBack}>Dashboard</button>
+            <button onClick={() => router.push("/design")} style={S.btnBack}>← Back to Design</button>
+          </div>
           <button onClick={() => router.push("/design-preview")} style={S.btnNext}>
             Design Preview →
           </button>

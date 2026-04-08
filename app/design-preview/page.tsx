@@ -7,12 +7,17 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
+import { getActiveProjectId, saveCurrentProject } from "@/app/_lib/projects";
 import type { RoomLayout, RoomSegment } from "@/app/_lib/room-types";
 import { getSelectedWalls } from "@/app/_lib/room-types";
+import {
+  type Point, computePoints, segStart, isClosed,
+  computeTransform, computeSignedArea, makeWallPtFn, buildRoomPath,
+} from "@/app/_lib/room-geo";
 
 // ─── Types (mirrored from design page) ───────────────────────────────────────
 
-type CompType     = "Shelf" | "Rod" | "DrawerStack";
+type CompType     = "Shelf" | "Rod" | "DrawerStack" | "Door";
 type ObstacleType = "LightSwitch" | "Outlet" | "Window" | "Unknown";
 
 interface ClosetComp {
@@ -20,6 +25,8 @@ interface ClosetComp {
   type:          CompType;
   positionIn:    number;
   drawerHeights: number[];
+  doorHeightIn?: number;
+  doorFlipped?:  boolean;
 }
 
 interface Obstacle {
@@ -75,6 +82,8 @@ const C_SHELF_BD = "#8b6437";
 const C_ROD      = "#7a5230";
 const C_DRAWER   = "#d4b896";
 const C_DRAWER_BD= "#8b6437";
+const C_DOOR     = "#a8c8e8";
+const C_DOOR_BD  = "#5a8ab0";
 const C_DIM      = "#555";
 const C_INT      = "#f5f0e8";
 const C_GAP      = "#e2ddd7";
@@ -104,7 +113,9 @@ function sectionEffH(run: WallRun, si: number, sysH: number): number {
   return Math.min(leftH, rightH);
 }
 function compHeight(comp: ClosetComp): number {
-  return comp.type === "DrawerStack" ? comp.drawerHeights.reduce((a,b) => a+b, 0) : 1;
+  if (comp.type === "DrawerStack") return comp.drawerHeights.reduce((a,b) => a+b, 0);
+  if (comp.type === "Door")        return comp.doorHeightIn ?? 80;
+  return 1;
 }
 
 function ceilingAtX(xIn: number, runW: number, profile: CeilingProfile): number {
@@ -129,56 +140,6 @@ function buildWallLabelMap(walls: ReturnType<typeof getSelectedWalls>): Map<stri
   const map = new Map<string, string>();
   walls.forEach((w, i) => map.set(w.id, `Wall ${letters[i] ?? String(i+1)}`));
   return map;
-}
-
-// ─── Room geometry (for top view) ─────────────────────────────────────────────
-
-type Point = [number, number];
-
-function computePoints(segs: RoomSegment[]): Point[] {
-  const pts: Point[] = [[0, 0]];
-  for (const s of segs) {
-    const [x, y] = pts[pts.length - 1];
-    if (s.dxIn !== undefined && s.dyIn !== undefined) {
-      pts.push([x + s.dxIn, y + s.dyIn]);
-    } else {
-      switch (s.direction) {
-        case "right": pts.push([x + s.lengthIn, y]); break;
-        case "left":  pts.push([x - s.lengthIn, y]); break;
-        case "down":  pts.push([x, y + s.lengthIn]); break;
-        case "up":    pts.push([x, y - s.lengthIn]); break;
-      }
-    }
-  }
-  return pts;
-}
-
-function qBez(t: number, p0: Point, p1: Point, p2: Point): Point {
-  const mt = 1-t;
-  return [mt*mt*p0[0]+2*mt*t*p1[0]+t*t*p2[0], mt*mt*p0[1]+2*mt*t*p1[1]+t*t*p2[1]];
-}
-function qBezTan(t: number, p0: Point, p1: Point, p2: Point): Point {
-  const mt = 1-t;
-  return [2*mt*(p1[0]-p0[0])+2*t*(p2[0]-p1[0]), 2*mt*(p1[1]-p0[1])+2*t*(p2[1]-p1[1])];
-}
-const BEZ_N = 64;
-function bezArcTable(p0: Point, p1: Point, p2: Point): {t:number;s:number}[] {
-  const tbl: {t:number;s:number}[] = [{t:0,s:0}];
-  let prev = p0;
-  for (let i=1; i<=BEZ_N; i++) {
-    const ti = i/BEZ_N, cur = qBez(ti,p0,p1,p2);
-    tbl.push({t:ti, s:tbl[tbl.length-1].s + Math.sqrt((cur[0]-prev[0])**2+(cur[1]-prev[1])**2)});
-    prev = cur;
-  }
-  return tbl;
-}
-function arcToT(tbl: {t:number;s:number}[], s: number): number {
-  const tot = tbl[tbl.length-1].s;
-  if (s <= 0) return 0; if (s >= tot) return 1;
-  let lo=0, hi=tbl.length-1;
-  while (hi-lo > 1) { const mid=(lo+hi)>>1; if(tbl[mid].s<=s) lo=mid; else hi=mid; }
-  const sp = tbl[hi].s-tbl[lo].s;
-  return tbl[lo].t + (sp<0.0001?0:(s-tbl[lo].s)/sp)*(tbl[hi].t-tbl[lo].t);
 }
 
 // ─── PreviewElevation ─────────────────────────────────────────────────────────
@@ -347,6 +308,35 @@ function PreviewElevation({
                           </g>
                         );
                       })}
+                    </g>
+                  );
+                }
+
+                if (comp.type === "Door") {
+                  const dh2     = comp.doorHeightIn ?? 80;
+                  const dhPx    = dh2 * SCALE;
+                  const dyPx    = floorY(comp.positionIn + dh2);
+                  const flipped = comp.doorFlipped ?? false;
+                  const hxPx    = xPx + wPx * (flipped ? 0.20 : 0.80);
+                  return (
+                    <g key={comp.id} pointerEvents="none">
+                      {/* Door panel */}
+                      <rect x={xPx} y={dyPx} width={wPx} height={dhPx}
+                        fill={C_DOOR} opacity={0.50} stroke={C_DOOR_BD} strokeWidth={1.5} rx={1} />
+                      {/* Inner frame rails */}
+                      <line x1={xPx+4} y1={dyPx+8} x2={xPx+wPx-4} y2={dyPx+8}
+                        stroke={C_DOOR_BD} strokeWidth={1} opacity={0.35} />
+                      <line x1={xPx+4} y1={dyPx+dhPx-8} x2={xPx+wPx-4} y2={dyPx+dhPx-8}
+                        stroke={C_DOOR_BD} strokeWidth={1} opacity={0.35} />
+                      {/* Handle */}
+                      <line x1={hxPx} y1={dyPx+dhPx*0.42} x2={hxPx} y2={dyPx+dhPx*0.58}
+                        stroke={C_DOOR_BD} strokeWidth={3} strokeLinecap="round" />
+                      <circle cx={hxPx} cy={dyPx+dhPx*0.5} r={3} fill={C_DOOR_BD} opacity={0.75} />
+                      {/* Height label */}
+                      <text x={xPx+wPx/2} y={dyPx+dhPx/2+4}
+                        textAnchor="middle" fontSize={8} fill={C_DOOR_BD} fontWeight="600">
+                        {dh2}"
+                      </text>
                     </g>
                   );
                 }
@@ -520,100 +510,28 @@ function PreviewRoomTopView({
     );
   }
 
-  const pts  = computePoints(segments);
-  const allP = [...pts];
-  for (let i=0; i<segments.length; i++) {
-    const s = segments[i];
-    if (s.cpDxIn !== undefined && s.cpDyIn !== undefined)
-      allP.push([pts[i][0]+s.cpDxIn, pts[i][1]+s.cpDyIn]);
+  // All geometry via shared room-geo module — identical pipeline to Design page RoomTopView.
+  const _origin: Point = (layout.originX !== undefined && layout.originY !== undefined)
+    ? [layout.originX, layout.originY] : [0, 0];
+  const pts = computePoints(segments, _origin);
+
+  const { scale: pscale, offX, offY, minX, minY } =
+    computeTransform(segments, 1, _origin, RTV_W, RTV_H, RTV_PAD);
+  const tx = (x: number) => offX + (x - minX) * pscale;
+  const ty = (y: number) => offY + (y - minY) * pscale;
+
+  const normalSign = computeSignedArea(segments, pts) >= 0 ? 1 : -1;
+  const closed     = isClosed(segments, pts);
+  const wallPt     = makeWallPtFn(segments, pts, normalSign, tx, ty);
+
+  function ptStr(...coords: [number, number][]): string {
+    return coords.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
   }
 
-  const xs     = allP.map(p=>p[0]);
-  const ys     = allP.map(p=>p[1]);
-  const minX   = Math.min(...xs), maxX = Math.max(...xs);
-  const minY   = Math.min(...ys), maxY = Math.max(...ys);
-  const rangeX = Math.max(maxX-minX, 1), rangeY = Math.max(maxY-minY, 1);
-  const drawW  = RTV_W - RTV_PAD*2, drawH = RTV_H - RTV_PAD*2;
-  const scale  = Math.min(drawW/rangeX, drawH/rangeY);
-  const offX   = RTV_W/2 - (rangeX/2)*scale;
-  const offY   = RTV_H/2 - (rangeY/2)*scale;
-
-  const tx = (x: number) => offX + (x-minX)*scale;
-  const ty = (y: number) => offY + (y-minY)*scale;
-
-  const closed = pts.length > 1
-    && Math.abs(pts[0][0]-pts[pts.length-1][0]) < 0.5
-    && Math.abs(pts[0][1]-pts[pts.length-1][1]) < 0.5;
-
-  // Signed area for normal direction
-  const n = pts.length-1;
-  let sig = 0;
-  for (let i=0; i<n; i++) sig += pts[i][0]*pts[i+1][1] - pts[i+1][0]*pts[i][1];
-  const normSign = sig >= 0 ? 1 : -1;
-
-  // Build room perimeter path (supports curves + breakpoints)
-  function buildPerimPath(): string {
-    if (pts.length < 2) return "";
-    let d = `M ${tx(pts[0][0]).toFixed(1)} ${ty(pts[0][1]).toFixed(1)}`;
-    for (let i=0; i<segments.length && i+1<pts.length; i++) {
-      const seg = segments[i];
-      const [ex,ey] = pts[i+1];
-      if (seg.cpDxIn !== undefined && seg.cpDyIn !== undefined) {
-        const cpx = tx(pts[i][0]+seg.cpDxIn), cpy = ty(pts[i][1]+seg.cpDyIn);
-        d += ` Q ${cpx.toFixed(1)} ${cpy.toFixed(1)} ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-      } else if (seg.breakDxIn !== undefined && seg.breakDyIn !== undefined) {
-        const bx = tx(pts[i][0]+seg.breakDxIn), by = ty(pts[i][1]+seg.breakDyIn);
-        d += ` L ${bx.toFixed(1)} ${by.toFixed(1)} L ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-      } else {
-        d += ` L ${tx(ex).toFixed(1)} ${ty(ey).toFixed(1)}`;
-      }
-    }
-    if (closed) d += " Z";
-    return d;
-  }
-
-  // Project a (alongIn, depthIn) pair onto segment si
-  function wallPt(si: number, alongIn: number, depthIn: number): [number, number] {
-    const [wx1,wy1] = pts[si];
-    if (si+1 >= pts.length) return [tx(wx1), ty(wy1)];
-    const [wx2,wy2] = pts[si+1];
-    const seg = segments[si];
-
-    if (seg.cpDxIn !== undefined && seg.cpDyIn !== undefined) {
-      const p0: Point = [wx1,wy1], p1: Point = [wx1+seg.cpDxIn, wy1+seg.cpDyIn], p2: Point = [wx2,wy2];
-      const tbl = bezArcTable(p0,p1,p2);
-      const t   = arcToT(tbl, alongIn);
-      const [bx,by]   = qBez(t,p0,p1,p2);
-      const [tdx,tdy] = qBezTan(t,p0,p1,p2);
-      const tlen = Math.sqrt(tdx*tdx+tdy*tdy)||1;
-      const nx = -tdy/tlen*normSign, ny = tdx/tlen*normSign;
-      return [tx(bx+nx*depthIn), ty(by+ny*depthIn)];
-    }
-    if (seg.breakDxIn !== undefined && seg.breakDyIn !== undefined) {
-      const bx = wx1+seg.breakDxIn, by = wy1+seg.breakDyIn;
-      const l1 = Math.sqrt(seg.breakDxIn**2+seg.breakDyIn**2);
-      const l2dx = wx2-bx, l2dy = wy2-by;
-      const l2 = Math.sqrt(l2dx**2+l2dy**2);
-      if (l1 > 0.01 && alongIn <= l1) {
-        const ux=seg.breakDxIn/l1, uy=seg.breakDyIn/l1;
-        const nx=-uy*normSign, ny=ux*normSign;
-        return [tx(wx1+ux*alongIn+nx*depthIn), ty(wy1+uy*alongIn+ny*depthIn)];
-      }
-      const rem = alongIn-l1;
-      if (l2 < 0.01) return [tx(bx),ty(by)];
-      const ux=l2dx/l2, uy=l2dy/l2;
-      const nx=-uy*normSign, ny=ux*normSign;
-      return [tx(bx+ux*rem+nx*depthIn), ty(by+uy*rem+ny*depthIn)];
-    }
-    const wlen = Math.sqrt((wx2-wx1)**2+(wy2-wy1)**2);
-    if (wlen < 0.01) return [tx(wx1),ty(wy1)];
-    const ux=(wx2-wx1)/wlen, uy=(wy2-wy1)/wlen;
-    const nx=-uy*normSign, ny=ux*normSign;
-    return [tx(wx1+ux*alongIn+nx*depthIn), ty(wy1+uy*alongIn+ny*depthIn)];
-  }
-
-  function ptStr(...coords: [number,number][]): string {
-    return coords.map(([x,y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  function segLen(seg: typeof segments[0]): number {
+    if (seg.dxIn !== undefined && seg.dyIn !== undefined)
+      return Math.sqrt(seg.dxIn**2 + seg.dyIn**2);
+    return seg.lengthIn;
   }
 
   return (
@@ -627,48 +545,83 @@ function PreviewRoomTopView({
       </text>
 
       {/* Room fill */}
-      {closed && <path d={buildPerimPath()} fill="rgba(255,255,255,0.70)" />}
+      {closed && (
+        <path d={buildRoomPath(segments, pts, closed, tx, ty)} fill="rgba(255,255,255,0.70)" />
+      )}
 
       {/* Closet footprints */}
       {runs.map(run => {
         const si = segments.findIndex(s => s.id === run.wallId);
-        if (si < 0 || si >= pts.length-1 || run.sections.length === 0) return null;
+        if (si < 0 || si >= pts.length - 1 || run.sections.length === 0) return null;
+        const fd = (d: number) => segments[si].footprintFlipped ? -d : d;
         return (
           <g key={run.wallId} pointerEvents="none">
             {run.sections.map((sec, sIdx) => {
               const lx = sIdx === 0 ? run.startIn : run.panels[sIdx-1].xIn + TV_PW;
               const rx = sIdx === run.panels.length ? run.endIn : run.panels[sIdx].xIn;
               if (rx <= lx) return null;
-              const a=wallPt(si,lx,0), b=wallPt(si,rx,0);
-              const c=wallPt(si,rx,sec.depthIn), d=wallPt(si,lx,sec.depthIn);
+              const a = wallPt(si, lx, 0),          b = wallPt(si, rx, 0);
+              const c = wallPt(si, rx, fd(sec.depthIn)), d = wallPt(si, lx, fd(sec.depthIn));
               return (
-                <polygon key={sec.id} points={ptStr(a,b,c,d)}
+                <polygon key={sec.id} points={ptStr(a, b, c, d)}
                   fill="rgba(195,155,100,0.30)" stroke="#c4935a" strokeWidth={0.75} />
               );
             })}
             {run.panels.map((panel, pi) => {
               const lD = run.sections[pi]?.depthIn ?? 12;
               const rD = run.sections[pi+1]?.depthIn ?? 12;
-              const mD = Math.max(lD,rD);
-              const a=wallPt(si,panel.xIn,0), b=wallPt(si,panel.xIn+TV_PW,0);
-              const c=wallPt(si,panel.xIn+TV_PW,mD), d=wallPt(si,panel.xIn,mD);
+              const mD = Math.max(lD, rD);
+              const a = wallPt(si, panel.xIn, 0),            b = wallPt(si, panel.xIn + TV_PW, 0);
+              const c = wallPt(si, panel.xIn + TV_PW, fd(mD)), d = wallPt(si, panel.xIn, fd(mD));
               return (
-                <polygon key={panel.id} points={ptStr(a,b,c,d)}
+                <polygon key={panel.id} points={ptStr(a, b, c, d)}
                   fill="#b8956a" stroke="#8b6437" strokeWidth={0.5} />
               );
             })}
             {(() => {
-              const d0=run.sections[0]?.depthIn??12, dN=run.sections[run.sections.length-1]?.depthIn??12;
-              const la=wallPt(si,run.startIn,0), lb=wallPt(si,run.startIn+TV_PW,0);
-              const lc=wallPt(si,run.startIn+TV_PW,d0), ld=wallPt(si,run.startIn,d0);
-              const ra=wallPt(si,run.endIn-TV_PW,0), rb=wallPt(si,run.endIn,0);
-              const rc=wallPt(si,run.endIn,dN),      rd=wallPt(si,run.endIn-TV_PW,dN);
+              const d0 = run.sections[0]?.depthIn ?? 12;
+              const dN = run.sections[run.sections.length-1]?.depthIn ?? 12;
+              const la = wallPt(si, run.startIn, 0),               lb = wallPt(si, run.startIn + TV_PW, 0);
+              const lc = wallPt(si, run.startIn + TV_PW, fd(d0)),   ld = wallPt(si, run.startIn, fd(d0));
+              const ra = wallPt(si, run.endIn - TV_PW, 0),          rb = wallPt(si, run.endIn, 0);
+              const rc = wallPt(si, run.endIn, fd(dN)),              rd = wallPt(si, run.endIn - TV_PW, fd(dN));
               return (
                 <>
-                  <polygon points={ptStr(la,lb,lc,ld)} fill="#b8956a" stroke="#8b6437" strokeWidth={1} />
-                  <polygon points={ptStr(ra,rb,rc,rd)} fill="#b8956a" stroke="#8b6437" strokeWidth={1} />
+                  <polygon points={ptStr(la, lb, lc, ld)} fill="#b8956a" stroke="#8b6437" strokeWidth={1} />
+                  <polygon points={ptStr(ra, rb, rc, rd)} fill="#b8956a" stroke="#8b6437" strokeWidth={1} />
                 </>
               );
+            })()}
+            {(() => {
+              const [wx1, wy1] = segStart(segments, pts, si);
+              const [wx2, wy2] = pts[si + 1] ?? pts[si];
+              const wl = Math.sqrt((wx2 - wx1) ** 2 + (wy2 - wy1) ** 2);
+              if (wl < 0.01) return null;
+              const depthAngle = (Math.atan2((wy2 - wy1) / wl, (wx2 - wx1) / wl) * 180 / Math.PI) - 90;
+              const d0 = run.sections[0]?.depthIn ?? 12;
+              const dN = run.sections[run.sections.length - 1]?.depthIn ?? 12;
+              type PD = { mid: number; depth: number; key: string };
+              const items: PD[] = [];
+              items.push({ mid: run.startIn + TV_PW / 2, depth: d0, key: 'lep' });
+              run.panels.forEach((panel, pi) => {
+                const lD = run.sections[pi]?.depthIn ?? 12;
+                const rD = run.sections[pi + 1]?.depthIn ?? 12;
+                items.push({ mid: panel.xIn + TV_PW / 2, depth: Math.max(lD, rD), key: `ip${panel.id}` });
+              });
+              items.push({ mid: run.endIn - TV_PW / 2, depth: dN, key: 'rep' });
+              return items.map(({ mid, depth, key }) => {
+                const [mx, my] = wallPt(si, mid, fd(depth / 2));
+                return (
+                  <text key={`pdlbl-${key}`}
+                    x={mx} y={my}
+                    textAnchor="middle" dominantBaseline="central"
+                    fontSize={10} fill="#000" fontWeight="900" pointerEvents="none"
+                    stroke="#fff" strokeWidth={2.5} paintOrder="stroke"
+                    transform={`rotate(${depthAngle.toFixed(1)},${mx.toFixed(1)},${my.toFixed(1)})`}>
+                    {depth}"
+                  </text>
+                );
+              });
             })()}
           </g>
         );
@@ -684,38 +637,46 @@ function PreviewRoomTopView({
 
       {/* Wall segments + labels */}
       {segments.map((seg, i) => {
-        if (i+1 >= pts.length) return null;
-        const [x1,y1] = pts[i], [x2,y2] = pts[i+1];
-        const hasClos = seg.selectedForDesign;
-        const color   = hasClos ? "#15803d" : "#a07040";
-        const sw2     = hasClos ? 3 : 1.5;
-        const midX = (tx(x1)+tx(x2))/2, midY = (ty(y1)+ty(y2))/2;
-        const dxL = tx(x2)-tx(x1), dyL = ty(y2)-ty(y1);
-        const slen = Math.sqrt(dxL*dxL+dyL*dyL)||1;
-        const nx = -dyL/slen, ny = dxL/slen;
-        const lx = midX+nx*14, ly = midY+ny*14;
+        if (i >= pts.length - 1) return null;
+        const [x1, y1] = segStart(segments, pts, i);
+        const [x2, y2] = pts[i + 1];
+        const sx1 = tx(x1), sy1 = ty(y1), sx2 = tx(x2), sy2 = ty(y2);
+        const hasClos = runs.some(r => r.wallId === seg.id);
+        const color   = !seg.usable ? "#9ca3af" : hasClos ? "#15803d" : "#a07040";
+        const sw2     = hasClos ? 3 : seg.usable ? 1.5 : 1;
 
-        let d: string;
+        let wallPathD: string;
         if (seg.cpDxIn !== undefined && seg.cpDyIn !== undefined) {
-          const cpx=tx(pts[i][0]+seg.cpDxIn), cpy=ty(pts[i][1]+seg.cpDyIn);
-          d = `M ${tx(x1)} ${ty(y1)} Q ${cpx} ${cpy} ${tx(x2)} ${ty(y2)}`;
+          const cpx = tx(x1 + seg.cpDxIn), cpy = ty(y1 + seg.cpDyIn);
+          wallPathD = `M ${sx1} ${sy1} Q ${cpx} ${cpy} ${sx2} ${sy2}`;
         } else if (seg.breakDxIn !== undefined && seg.breakDyIn !== undefined) {
-          const bx=tx(pts[i][0]+seg.breakDxIn), by=ty(pts[i][1]+seg.breakDyIn);
-          d = `M ${tx(x1)} ${ty(y1)} L ${bx} ${by} L ${tx(x2)} ${ty(y2)}`;
+          const bx = tx(x1 + seg.breakDxIn), by = ty(y1 + seg.breakDyIn);
+          wallPathD = `M ${sx1} ${sy1} L ${bx} ${by} L ${sx2} ${sy2}`;
         } else {
-          d = `M ${tx(x1)} ${ty(y1)} L ${tx(x2)} ${ty(y2)}`;
+          wallPathD = `M ${sx1} ${sy1} L ${sx2} ${sy2}`;
         }
 
+        const dxL = sx2 - sx1, dyL = sy2 - sy1;
+        const sl  = Math.sqrt(dxL*dxL + dyL*dyL) || 1;
+        const nx  = -dyL/sl, ny = dxL/sl;
+        const midX = (sx1+sx2)/2, midY = (sy1+sy2)/2;
+        const lx = midX + nx*14, ly = midY + ny*14;
+
         const wallLabel = wallLabelMap.get(seg.id);
+        const lenStr    = Math.round(segLen(seg)) + '"';
         return (
           <g key={seg.id} pointerEvents="none">
-            <path d={d} fill="none" stroke={color} strokeWidth={sw2} strokeLinecap="round"
+            <path d={wallPathD} fill="none" stroke={color} strokeWidth={sw2} strokeLinecap="round"
               opacity={seg.usable ? 1 : 0.45} />
             {wallLabel && (
-              <text x={lx} y={ly-2} textAnchor="middle"
-                fontSize={9} fill={color} fontWeight="800">
-                {wallLabel}
-              </text>
+              <>
+                <text x={lx} y={ly - 5} textAnchor="middle" fontSize={9} fill={color} fontWeight="800">
+                  {wallLabel}
+                </text>
+                <text x={lx} y={ly + 6} textAnchor="middle" fontSize={8} fill={color} opacity={0.75}>
+                  {lenStr}
+                </text>
+              </>
             )}
           </g>
         );
@@ -837,8 +798,8 @@ export default function DesignPreviewPage() {
             <span style={{ fontSize:"12px", color:"#888" }}>{layout.clientName}</span>
           )}
         </div>
-        {/* Step indicator */}
-        <div style={{ display:"flex", gap:"6px" }}>
+        {/* Step indicator + actions */}
+        <div style={{ display:"flex", gap:"6px", alignItems:"center" }}>
           {["Setup","Room Layout","Design","Worksheet","Preview","Pricing"].map((s,i) => (
             <span key={s} style={{
               fontSize:"11px", padding:"3px 10px", borderRadius:"20px",
@@ -847,6 +808,18 @@ export default function DesignPreviewPage() {
               fontWeight: i === 4 ? "700" : "400",
             }}>{s}</span>
           ))}
+          <button onClick={() => { saveCurrentProject(getActiveProjectId()); }}
+            style={{ fontSize:"12px", fontWeight:"700", cursor:"pointer", marginLeft:"8px",
+              padding:"5px 14px", borderRadius:"6px", border:"none",
+              backgroundColor:"#3a5a3a", color:"#fff" }}>
+            Save
+          </button>
+          <button onClick={() => router.push("/")}
+            style={{ fontSize:"12px", fontWeight:"600", cursor:"pointer",
+              padding:"5px 14px", borderRadius:"6px",
+              border:"1.5px solid #4a4a4a", backgroundColor:"transparent", color:"#aaa" }}>
+            Dashboard
+          </button>
         </div>
       </header>
 
