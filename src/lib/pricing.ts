@@ -14,7 +14,8 @@ const SHELF_16_WIDE   = 100; // 16" deep, >30" wide
 const ROD_NARROW = 99;       // ≤30" wide
 const ROD_WIDE   = 118;      // >30" wide
 
-const DRAWER_75 = 310;       // 75% extension drawer box (any height)
+const DRAWER_75  = 310;      // 75% extension drawer box (any height)
+const DRAWER_100 = 355;      // 100% extension drawer box (any height)
 
 export const ADJUSTMENT_RATE = 0.11; // 11%
 
@@ -101,10 +102,11 @@ export interface PricingSection {
   widthIn: number;
   depthIn: number;
   components: {
-    type:          "Shelf" | "Rod" | "DrawerStack" | "Door";
-    drawerHeights: number[];
-    doorHeightIn?: number;
-    doorFlipped?:  boolean;
+    type:               "Shelf" | "Rod" | "DrawerStack" | "Door";
+    drawerHeights:      number[];
+    drawerExtensions?:  ("75" | "100")[];  // per-drawer extension, parallel to drawerHeights
+    doorHeightIn?:      number;
+    doorFlipped?:       boolean;
   }[];
 }
 
@@ -239,15 +241,44 @@ export function computePricing(
   if (rodsWide   > 0) lineItems.push({ label: "Rod (>30\")", qty: rodsWide,   unitPrice: ROD_WIDE,   total: rodsWide   * ROD_WIDE   });
 
   // ── 4. Drawers ─────────────────────────────────────────────────────────────
-  let drawerCount = 0;
+  // Count per extension type; price each separately.
+  let drawer75Count  = 0;
+  let drawer100Count = 0;
   for (const sec of sections) {
     for (const comp of sec.components) {
-      if (comp.type === "DrawerStack") drawerCount += comp.drawerHeights.length;
+      if (comp.type !== "DrawerStack") continue;
+      comp.drawerHeights.forEach((_, di) => {
+        const ext = comp.drawerExtensions?.[di] ?? "75";
+        if (ext === "100") drawer100Count++; else drawer75Count++;
+      });
     }
   }
+  const drawerCount = drawer75Count + drawer100Count;
 
-  if (drawerCount > 0) {
-    lineItems.push({ label: "Drawer box 75% ext.", qty: drawerCount, unitPrice: DRAWER_75, total: drawerCount * DRAWER_75 });
+  if (drawer75Count > 0) {
+    lineItems.push({ label: "Drawer box 75% ext.",  qty: drawer75Count,  unitPrice: DRAWER_75,  total: drawer75Count  * DRAWER_75  });
+  }
+  if (drawer100Count > 0) {
+    lineItems.push({ label: "Drawer box 100% ext.", qty: drawer100Count, unitPrice: DRAWER_100, total: drawer100Count * DRAWER_100 });
+  }
+
+  // ── 4b. Extra deep drawer add-ons (flat per drawer, deco-independent) ────────
+  // Applies when section depth exceeds 24" — manufacturing add-on for deeper boxes.
+  let extraDeep24 = 0;  // 24"–28" depth: +$80/drawer
+  let extraDeep28 = 0;  // 28"–32" depth: +$190/drawer
+  for (const sec of sections) {
+    const dCount = sec.components.reduce(
+      (n, c) => c.type === "DrawerStack" ? n + c.drawerHeights.length : n, 0
+    );
+    if (dCount === 0) continue;
+    if (sec.depthIn > 28) extraDeep28 += dCount;
+    else if (sec.depthIn > 24) extraDeep24 += dCount;
+  }
+  if (extraDeep24 > 0) {
+    lineItems.push({ label: 'Drawer extra deep 24–28"', qty: extraDeep24, unitPrice: 80,  total: extraDeep24 * 80  });
+  }
+  if (extraDeep28 > 0) {
+    lineItems.push({ label: 'Drawer extra deep 28–32"', qty: extraDeep28, unitPrice: 190, total: extraDeep28 * 190 });
   }
 
   // ── 5. Doors ───────────────────────────────────────────────────────────────

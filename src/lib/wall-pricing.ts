@@ -15,12 +15,13 @@ export const PANEL_W_IN = 0.75;
 // Defined here so consumers don't need to import from a page component.
 
 export interface StoredComp {
-  id:            number;
-  type:          "Shelf" | "Rod" | "DrawerStack" | "Door";
-  positionIn:    number;
-  drawerHeights: number[];
-  doorHeightIn?: number;
-  doorFlipped?:  boolean;
+  id:                 number;
+  type:               "Shelf" | "Rod" | "DrawerStack" | "Door";
+  positionIn:         number;
+  drawerHeights:      number[];
+  drawerExtensions?:  ("75" | "100")[];
+  doorHeightIn?:      number;
+  doorFlipped?:       boolean;
 }
 
 export interface StoredSection {
@@ -79,10 +80,11 @@ export function runToPricingSections(run: StoredRun): PricingSection[] {
     widthIn:    secWidth(run.panels, run.startIn, run.endIn, i),
     depthIn:    s.depthIn,
     components: s.comps.map(c => ({
-      type:          c.type,
-      drawerHeights: c.drawerHeights,
-      doorHeightIn:  c.doorHeightIn,
-      doorFlipped:   c.doorFlipped,
+      type:              c.type,
+      drawerHeights:     c.drawerHeights,
+      drawerExtensions:  c.drawerExtensions,
+      doorHeightIn:      c.doorHeightIn,
+      doorFlipped:       c.doorFlipped,
     })),
   }));
 }

@@ -520,8 +520,25 @@ export default function PresentationPage() {
           </>
         )}
 
+        {/* Footer note */}
+        <div style={{
+          marginTop: "40px",
+          paddingTop: "20px",
+          borderTop: "1px solid #e0dbd4",
+          textAlign: "center",
+        }}>
+          <p style={{
+            fontSize: "13px",
+            color: "#555",
+            margin: 0,
+            fontStyle: "italic",
+          }}>
+            Tax, delivery included. Free installation is provided as well.
+          </p>
+        </div>
+
         {/* Bottom nav */}
-        <div style={{ marginTop: "52px", display: "flex", justifyContent: "space-between" }}>
+        <div style={{ marginTop: "28px", display: "flex", justifyContent: "space-between" }}>
           <button onClick={() => router.push("/worksheet")} style={S.btnBack}>
             ← Back to Worksheet
           </button>

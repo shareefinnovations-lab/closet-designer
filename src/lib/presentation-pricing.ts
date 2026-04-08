@@ -89,7 +89,7 @@ export type DecoOption = "none" | "deco100_400_700" | "deco500_600";
 export interface DecoOptionDef {
   label:         string;
   spec:          string;
-  pricePerPiece: number;
+  pricePerPiece: number;  // standard (non-oversized) price per drawer face
 }
 
 export const DECO_OPTION_ORDER: DecoOption[] = ["none", "deco100_400_700", "deco500_600"];
@@ -99,6 +99,62 @@ export const DECO_OPTIONS: Record<DecoOption, DecoOptionDef> = {
   deco100_400_700: { label: "Deco 100–400 / 700",    spec: "100–400 series & 700 series", pricePerPiece: 170 },
   deco500_600:     { label: "Deco 500 / Shaker 600", spec: "500 series & Shaker 600",     pricePerPiece: 306 },
 };
+
+// ─── Oversized Drawer Pricing Helpers ─────────────────────────────────────────
+//
+// Drawer faces are priced differently when the drawer is wider or taller than
+// the standard bracket. Depths > 24" add a flat extra-deep cost (already
+// computed in pricing.ts / computePricing).
+//
+// Extra Wide:
+//   30–36"  → base no-deco add-on $65  | deco100 $170 | deco500 $309
+//   36–42"  → base no-deco add-on $90  | deco100 $220 | deco500 $396
+//
+// Extra Tall (per drawer face):
+//   13¾–15"  → base add-on $140 | deco100 $220 | deco500 $396
+//   16¼–24"  → base add-on $445 | deco100 $220 | deco500 $396
+//
+// When deco IS chosen: the deco face cost is the size-appropriate column value
+// (replaces the standard flat $170/$306).
+// When NO deco is chosen: the base add-on is charged for width and/or height.
+
+/**
+ * Return the deco face price for one drawer given its section width and face height.
+ * Returns 0 when decoOption is "none".
+ */
+export function drawerFaceDecoPrice(
+  widthIn:    number,
+  heightIn:   number,
+  deco:       DecoOption,
+): number {
+  if (deco === "none") return 0;
+  const d1 = deco === "deco100_400_700";
+
+  // Extra wide 36–42"
+  if (widthIn > 36) return d1 ? 220 : 396;
+  // Extra tall (any width) — supersedes extra-wide 30–36" row
+  if (heightIn > 13.75) return d1 ? 220 : 396;
+  // Extra wide 30–36"
+  if (widthIn > 30) return d1 ? 170 : 309;
+  // Standard
+  return d1 ? 170 : 306;
+}
+
+/**
+ * Return the base (no-deco) oversized add-on for one drawer face
+ * given section width and drawer face height.
+ * Only applicable when decoOption === "none".
+ */
+export function drawerBaseOversizeAddOn(widthIn: number, heightIn: number): number {
+  let addOn = 0;
+  // Extra wide
+  if (widthIn > 36)      addOn += 90;
+  else if (widthIn > 30) addOn += 65;
+  // Extra tall
+  if (heightIn > 16.25)       addOn += 445;
+  else if (heightIn > 13.75)  addOn += 140;
+  return addOn;
+}
 
 // ─── Accessories ──────────────────────────────────────────────────────────────
 
@@ -404,12 +460,34 @@ export function computePresentationPricing(
   const backingDef   = BACKING_OPTIONS[backingOption];
   const backingPrice = r2(counts.backingSquareFeet * backingDef.ratePerSqFt);
 
-  const decoDef         = DECO_OPTIONS[decoOption];
-  // Deco piece pricing applies to drawers only (doors use bracket-based deco add-ons below)
-  const decoTotalPieces = counts.drawerCount;
-  const decoPrice       = decoTotalPieces > 0 ? decoDef.pricePerPiece * decoTotalPieces : 0;
+  const decoDef = DECO_OPTIONS[decoOption];
 
-  // Door deco add-on pricing — per door, based on width × height bracket
+  // ── Drawer deco pricing — per drawer, size-aware ──────────────────────────
+  // When deco is chosen: look up the size-appropriate face price per drawer.
+  // When no deco:        charge the base oversized add-on (extra wide/tall only).
+  // Extra-deep add-ons are already included in base.total (from computePricing).
+  let decoTotalPieces   = 0;
+  let drawerDecoTotal   = 0;       // total deco face cost (all drawers)
+  let drawerOversizeBase = 0;      // total base oversized add-on when no deco
+
+  for (const sec of sections) {
+    for (const comp of sec.components) {
+      if (comp.type !== "DrawerStack") continue;
+      for (const dh of comp.drawerHeights) {
+        decoTotalPieces++;
+        if (decoOption !== "none") {
+          drawerDecoTotal += drawerFaceDecoPrice(sec.widthIn, dh, decoOption);
+        } else {
+          drawerOversizeBase += drawerBaseOversizeAddOn(sec.widthIn, dh);
+        }
+      }
+    }
+  }
+
+  const decoPrice        = drawerDecoTotal;
+  const decoPricePerPiece = decoTotalPieces > 0 ? Math.round(drawerDecoTotal / decoTotalPieces) : 0;
+
+  // ── Door deco add-on pricing — per door, based on width × height bracket ──
   let doorDecoTotal = 0;
   if (decoOption !== "none") {
     for (const sec of sections) {
@@ -479,6 +557,13 @@ export function computePresentationPricing(
       label: `Deco — ${decoDef.label} (${decoTotalPieces} drawer${decoTotalPieces !== 1 ? "s" : ""})`,
       originalPrice:   decoPrice,
       discountedPrice: lineDiscount(decoPrice),
+    });
+  }
+  if (drawerOversizeBase > 0) {
+    pricedItems.push({
+      label: `Oversized Drawer Add-ons — base finish (extra wide/tall)`,
+      originalPrice:   drawerOversizeBase,
+      discountedPrice: lineDiscount(drawerOversizeBase),
     });
   }
   if (doorDecoTotal > 0) {
@@ -601,7 +686,7 @@ export function computePresentationPricing(
     backingSquareFeet:  counts.backingSquareFeet,
     backingPrice,
     decoTotalPieces,
-    decoPricePerPiece:  decoDef.pricePerPiece,
+    decoPricePerPiece,
     decoPrice,
     accessoryLines,
     accessoriesTotal,

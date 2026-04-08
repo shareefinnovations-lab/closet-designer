@@ -21,10 +21,11 @@ type CompType = "Shelf" | "Rod" | "DrawerStack" | "Door";
 type ObstacleType = "LightSwitch" | "Outlet" | "Window" | "Unknown";
 
 interface ClosetComp {
-  id:            number;
-  type:          CompType;
-  positionIn:    number;
-  drawerHeights: number[];
+  id:                 number;
+  type:               CompType;
+  positionIn:         number;
+  drawerHeights:      number[];
+  drawerExtensions?:  ("75" | "100")[];  // per-drawer pull-out extension, parallel to drawerHeights
   // Door-specific fields
   doorHeightIn?: number;   // Door: height in inches (default 80, capped at section effH)
   doorFlipped?:  boolean;  // Door: false = handle on right (default), true = handle on left
@@ -101,8 +102,17 @@ const LOCK_H_IN      = 1;
 const LOCK_H_PX      = LOCK_H_IN * SCALE;
 const MIN_SEC_W      = 6;    // minimum section width (inches)
 const SNAP_IN        = 1;
-const DRAWER_MAX_TOP = 50;   // drawer stack top cannot exceed this height from floor
-const DRAWER_MAX_W   = 36;   // drawer section max width (inches)
+const DRAWER_MAX_TOP = 56;   // drawer stack top cannot exceed this height from floor
+const DRAWER_MAX_W   = 42;   // drawer section max width (inches)
+const DRAWER_FACE_HEIGHTS = [3.25, 5, 6.25, 7.5, 8.25, 10, 11.25, 12.5] as const;
+/** Format a standard drawer face height as a fraction string, e.g. 7.5 → '7½"' */
+function drawerHLabel(h: number): string {
+  const m: Record<number, string> = {
+    3.25: '3¼"', 5: '5"', 6.25: '6¼"', 7.5: '7½"',
+    8.25: '8¼"', 10: '10"', 11.25: '11¼"', 12.5: '12½"',
+  };
+  return m[h] ?? `${h}"`;
+}
 const LOCK_SPAN_MIN  = 43;   // shelf/rod locked when span >= this (43–48" range)
 const MAX_SPAN_IN    = 48;   // shelf/rod not allowed when span > this
 const DOOR_MAX_SEC_W = 24;   // door only allowed in sections ≤ this width
@@ -467,7 +477,7 @@ function runAddComp(run: WallRun, secId: number, type: CompType, sysH: number): 
   }
   // Use section effective height (min of bounding panels) for default placement
   const effH = si >= 0 ? sectionEffH(run, si, sysH) : sysH;
-  const dh   = [8, 8, 8];
+  const dh   = [7.5, 7.5, 7.5];
   const tot  = dh.reduce((a, b) => a + b, 0);
   const comp: ClosetComp = {
     id: nextId(), type,
@@ -476,7 +486,8 @@ function runAddComp(run: WallRun, secId: number, type: CompType, sysH: number): 
       : type === "Door"
       ? 0
       : Math.floor(effH / 2),
-    drawerHeights: type === "DrawerStack" ? dh : [],
+    drawerHeights:     type === "DrawerStack" ? dh : [],
+    drawerExtensions:  type === "DrawerStack" ? dh.map(() => "75" as const) : undefined,
     ...(type === "Door" ? {
       doorHeightIn: Math.min(DOOR_DEFAULT_H, effH),
       doorFlipped:  false,
@@ -667,7 +678,7 @@ function resolvePos(comp: ClosetComp, effH: number, raw: number, all: ClosetComp
     const max = Math.max(0, effH - cH);
     return Math.max(0, Math.min(max, Math.round(raw / SNAP_IN) * SNAP_IN));
   }
-  // Enforce 50" drawer-top ceiling
+  // Enforce drawer-top ceiling
   const max = comp.type === "DrawerStack"
     ? Math.min(effH - LOCK_H_IN - cH, DRAWER_MAX_TOP - cH)
     : effH - LOCK_H_IN - cH;
@@ -2239,7 +2250,7 @@ function CompCard({ comp, sec, secEffH, secWidthIn, onUpdate, onDelete }: {
           {atLimit && (
             <span style={{ fontSize: "10px", color: "#c0392b", fontWeight: "700", backgroundColor: "#fde8e8",
               borderRadius: "3px", padding: "1px 5px" }}>
-              50" max
+              {DRAWER_MAX_TOP}" max
             </span>
           )}
           {isLocked && (
@@ -2286,26 +2297,75 @@ function CompCard({ comp, sec, secEffH, secWidthIn, onUpdate, onDelete }: {
             {" · "}top at: <strong style={{ color: atLimit ? "#c0392b" : "#555" }}>{top}"</strong>
             <span style={{ color: "#aaa" }}> / {DRAWER_MAX_TOP}" max</span>
           </div>
-          {comp.drawerHeights.map((dh, di) => (
-            <div key={di} style={{ display: "flex", alignItems: "center", gap: "4px", marginBottom: "3px" }}>
-              <span style={{ fontSize: "10px", color: "#bbb", width: "16px" }}>#{di + 1}</span>
-              <input type="number" style={{ ...inp, width: "46px" }} min={4} step={1} value={dh}
-                onChange={e => {
-                  const heights = comp.drawerHeights.map((h, hi) => hi === di ? Number(e.target.value) : h);
-                  onUpdate({ drawerHeights: heights });
-                }} />
-              <span style={{ fontSize: "10px", color: "#aaa" }}>″</span>
-              {comp.drawerHeights.length > 1 && (
-                <button style={{ ...nudge, color: "#c0392b", borderColor: "#e8c0b8", padding: "2px 6px", fontSize: "11px" }}
-                  onClick={() => onUpdate({ drawerHeights: comp.drawerHeights.filter((_, hi) => hi !== di) })}>
-                  ×
-                </button>
-              )}
-            </div>
-          ))}
+          {comp.drawerHeights.map((dh, di) => {
+            const isPresetH = (DRAWER_FACE_HEIGHTS as readonly number[]).includes(dh);
+            const currExts  = comp.drawerExtensions ?? comp.drawerHeights.map(() => "75" as const);
+            const ext       = currExts[di] ?? "75";
+            return (
+              <div key={di} style={{ display: "flex", alignItems: "center", gap: "4px", marginBottom: "4px", flexWrap: "wrap" }}>
+                <span style={{ fontSize: "10px", color: "#bbb", width: "16px", flexShrink: 0 }}>#{di + 1}</span>
+                {/* Height: preset dropdown + optional custom input */}
+                <select
+                  style={{ ...inp, width: "80px", padding: "4px 5px" }}
+                  value={isPresetH ? String(dh) : "custom"}
+                  onChange={e => {
+                    if (e.target.value === "custom") {
+                      // Switch to custom mode — initialise to 8 (non-preset value)
+                      onUpdate({ drawerHeights: comp.drawerHeights.map((h, hi) => hi === di ? 8 : h) });
+                    } else {
+                      onUpdate({ drawerHeights: comp.drawerHeights.map((h, hi) => hi === di ? Number(e.target.value) : h) });
+                    }
+                  }}>
+                  {DRAWER_FACE_HEIGHTS.map(fh => (
+                    <option key={fh} value={fh}>{drawerHLabel(fh)}</option>
+                  ))}
+                  <option value="custom">Custom…</option>
+                </select>
+                {!isPresetH && (
+                  <input type="number" style={{ ...inp, width: "44px" }} min={1} max={24} step={0.25}
+                    value={dh}
+                    onChange={e => {
+                      const v = Math.max(1, Math.min(24, parseFloat(e.target.value) || 1));
+                      onUpdate({ drawerHeights: comp.drawerHeights.map((h, hi) => hi === di ? v : h) });
+                    }} />
+                )}
+                {/* Per-drawer pull-out extension */}
+                {(["75", "100"] as const).map(val => (
+                  <button key={val}
+                    style={{ padding: "2px 7px", fontSize: "10px", cursor: "pointer", borderRadius: "3px",
+                      border: `1px solid ${ext === val ? C_DRAWER_BD : "#c8c4be"}`,
+                      backgroundColor: ext === val ? "#f5eee4" : "#fff",
+                      color: ext === val ? C_DRAWER_BD : "#777",
+                      fontWeight: ext === val ? "700" : "400" }}
+                    onClick={() => {
+                      const newExts = currExts.map((ex, ei) => ei === di ? val : ex);
+                      onUpdate({ drawerExtensions: newExts });
+                    }}>
+                    {val}%
+                  </button>
+                ))}
+                {comp.drawerHeights.length > 1 && (
+                  <button style={{ ...nudge, color: "#c0392b", borderColor: "#e8c0b8", padding: "2px 6px", fontSize: "11px" }}
+                    onClick={() => {
+                      const newHeights = comp.drawerHeights.filter((_, hi) => hi !== di);
+                      const newExts    = currExts.filter((_, hi) => hi !== di);
+                      onUpdate({ drawerHeights: newHeights, drawerExtensions: newExts });
+                    }}>
+                    ×
+                  </button>
+                )}
+              </div>
+            );
+          })}
           <button style={{ marginTop: "3px", padding: "3px 9px", fontSize: "11px", cursor: "pointer",
             border: "1px solid #c8c4be", borderRadius: "4px", backgroundColor: "#fff", color: "#444" }}
-            onClick={() => onUpdate({ drawerHeights: [...comp.drawerHeights, 8] })}>
+            onClick={() => {
+              const currExts = comp.drawerExtensions ?? comp.drawerHeights.map(() => "75" as const);
+              onUpdate({
+                drawerHeights:    [...comp.drawerHeights, 7.5],
+                drawerExtensions: [...currExts, "75" as const],
+              });
+            }}>
             + Add Drawer
           </button>
         </div>

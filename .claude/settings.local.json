@@ -7,7 +7,20 @@
       "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -20)",
       "Bash(cd C:/Users/ilham/closet-saas && npx next build 2>&1 | tail -15)",
       "Bash(gh auth status 2>&1)",
-      "Bash(npm run:*)"
+      "Bash(npm run:*)",
+      "Bash(cd C:/Users/ilham/closet-saas && npx tsc --noEmit 2>&1)",
+      "Bash(cd C:/Users/ilham/closet-saas && npx tsc --noEmit --project tsconfig.json 2>&1 | head -40)",
+      "Bash(cd \"C:/Users/ilham/closet-saas\" && node -e \"\nconst fs = require\\('fs'\\);\nconst files = [\n  'app/_lib/room-types.ts',\n  'app/room-layout/page.tsx',\n  'app/design/page.tsx',\n  'app/setup/page.tsx',\n];\nfiles.forEach\\(f => {\n  const size = fs.statSync\\(f\\).size;\n  console.log\\(f, size + ' bytes'\\);\n}\\);\n\")",
+      "Bash(cd \"C:/Users/ilham/closet-saas\" && node -e \"const fs = require\\('fs'\\); const s = fs.statSync\\('app/walkin/page.tsx'\\); console.log\\('walkin page:', s.size, 'bytes'\\); const lines = fs.readFileSync\\('app/walkin/page.tsx','utf8'\\).split\\('\\\\n'\\).length; console.log\\('lines:', lines\\);\")",
+      "Bash(npx tsc:*)",
+      "Bash(find \"C:\\\\Users\\\\ilham\\\\closet-saas\\\\app\" -name \"*.ts\" -o -name \"*.tsx\" | xargs grep -l \"ReturnWall\" 2>/dev/null)",
+      "Bash(npx next:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "mcp__ide__getDiagnostics",
+      "Bash(python3 -c \"\nimport json, sys\n\nmsgs = []\nwith open\\('C:/Users/ilham/.claude/projects/C--Users-ilham-closet-saas/c1256c8d-bf72-4643-89a9-37fef567c7de.jsonl', 'r', encoding='utf-8', errors='replace'\\) as f:\n    for line in f:\n        line = line.strip\\(\\)\n        if not line: continue\n        try:\n            obj = json.loads\\(line\\)\n            t = obj.get\\('type',''\\)\n            if t == 'user':\n                msgs.append\\(obj\\)\n        except: \n            pass\n\nprint\\('user msgs:', len\\(msgs\\)\\)\nif msgs:\n    last = msgs[-1]\n    c = last.get\\('message',{}\\).get\\('content',''\\)\n    if isinstance\\(c, list\\):\n        for x in c:\n            if isinstance\\(x,dict\\): print\\(x.get\\('text',''\\)[:3000]\\)\n    else:\n        print\\(str\\(c\\)[:3000]\\)\n\" 2>/dev/null)",
+      "Bash(sed -n '6064p' \"C:/Users/ilham/.claude/projects/C--Users-ilham-closet-saas/c1256c8d-bf72-4643-89a9-37fef567c7de.jsonl\" | python3 -c \"\nimport json, sys\ndata = json.loads\\(sys.stdin.read\\(\\)\\)\ncontent = data['message']['content']\nprint\\(content[2000:8000]\\)\n\" 2>/dev/null)"
     ]
   }
 }
