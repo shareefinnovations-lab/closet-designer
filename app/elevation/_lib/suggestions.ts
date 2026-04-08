@@ -100,8 +100,8 @@ export interface SuggestionResult {
 
 export function generateSuggestion(config: Config): SuggestionResult {
   const text     = config.remarks.toLowerCase().trim();
-  const wallW    = config.wallWidthIn;
-  const panelH   = defaultPanelHeight(config.ceilingHeightIn);
+  const wallW    = config.wallWidthIn    ?? 0;
+  const panelH   = defaultPanelHeight(config.ceilingHeightIn ?? 96);
   const sectionH = panelH;
 
   const wantsLongHang = has(text, LONG_HANG_KEYWORDS);

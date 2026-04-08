@@ -68,14 +68,14 @@ export default function ElevationPage() {
       if (rawDesign) {
         // Restore saved design state
         const saved = JSON.parse(rawDesign) as Partial<SavedDesign>;
-        setSections(saved.sections     ?? makeInitialSections(cfg.wallWidthIn));
-        setPanelHeights(saved.panelHeights ?? Array.from({ length: 4 }, () => defaultPanelHeight(cfg.ceilingHeightIn)));
-        setCeilingH(saved.ceilingH     ?? cfg.ceilingHeightIn);
+        setSections(saved.sections     ?? makeInitialSections(cfg.wallWidthIn    ?? 0));
+        setPanelHeights(saved.panelHeights ?? Array.from({ length: 4 }, () => defaultPanelHeight(cfg.ceilingHeightIn ?? 96)));
+        setCeilingH(saved.ceilingH     ?? cfg.ceilingHeightIn ?? 96);
       } else {
         // No design yet — use defaults
-        setSections(makeInitialSections(cfg.wallWidthIn));
-        setPanelHeights(Array.from({ length: 4 }, () => defaultPanelHeight(cfg.ceilingHeightIn)));
-        setCeilingH(cfg.ceilingHeightIn);
+        setSections(makeInitialSections(cfg.wallWidthIn ?? 0));
+        setPanelHeights(Array.from({ length: 4 }, () => defaultPanelHeight(cfg.ceilingHeightIn ?? 96)));
+        setCeilingH(cfg.ceilingHeightIn ?? 96);
       }
 
       setReady(true);
@@ -129,10 +129,10 @@ export default function ElevationPage() {
   }
 
   // ── Derived from config ───────────────────────────────────────────────────────
-  const wallW        = config.wallWidthIn;
-  const overallDepth = config.closetDepthIn;
-  const leftReturn   = config.leftReturnIn;
-  const rightReturn  = config.rightReturnIn;
+  const wallW        = config.wallWidthIn   ?? 0;
+  const overallDepth = config.closetDepthIn ?? 0;
+  const leftReturn   = config.leftReturnIn  ?? 0;
+  const rightReturn  = config.rightReturnIn ?? 0;
 
   // ── Height helpers ────────────────────────────────────────────────────────────
   function clampPanel(h: number): number {
