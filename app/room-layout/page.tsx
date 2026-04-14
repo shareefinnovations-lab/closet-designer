@@ -135,23 +135,24 @@ const TV_PANEL_W = 0.75;
 // Curve handles (teal circles): drag to reshape bezier arc control point.
 
 function PerimeterCanvas({
-  segments, selectedId, onSelect, designRuns, onVertexDrag, onBreakpointDrag, onCurveDrag, onAnchorDrag,
+  segments, selectedId, onSelect, designRuns, onVertexDrag, onVertexDragStart, onBreakpointDrag, onCurveDrag, onAnchorDrag,
   zoom, originPt, showLegend, pan, onPanChange, onZoomChange,
 }: {
-  segments:         RoomSegment[];
-  selectedId:       string | null;
-  onSelect:         (id: string) => void;
-  designRuns:       TopViewRun[];
-  onVertexDrag:     (vertexIdx: number, xIn: number, yIn: number) => void;
-  onBreakpointDrag: (segIdx: number, dxIn: number, dyIn: number) => void;
-  onCurveDrag:      (segIdx: number, dxIn: number, dyIn: number) => void;
-  onAnchorDrag:     (segIdx: number, xIn: number, yIn: number) => void;
-  zoom:             number;
-  originPt:         Point;
-  showLegend:       boolean;
-  pan:              [number, number];
-  onPanChange:      (p: [number, number]) => void;
-  onZoomChange:     (z: number) => void;
+  segments:           RoomSegment[];
+  selectedId:         string | null;
+  onSelect:           (id: string) => void;
+  designRuns:         TopViewRun[];
+  onVertexDrag:       (vertexIdx: number, xIn: number, yIn: number) => void;
+  onVertexDragStart?: (vertexIdx: number, xIn: number, yIn: number) => void;
+  onBreakpointDrag:   (segIdx: number, dxIn: number, dyIn: number) => void;
+  onCurveDrag:        (segIdx: number, dxIn: number, dyIn: number) => void;
+  onAnchorDrag:       (segIdx: number, xIn: number, yIn: number) => void;
+  zoom:               number;
+  originPt:           Point;
+  showLegend:         boolean;
+  pan:                [number, number];
+  onPanChange:        (p: [number, number]) => void;
+  onZoomChange:       (z: number) => void;
 }) {
   const svgRef          = useRef<SVGSVGElement>(null);
   const lockRef         = useRef<CanvasTransform | null>(null);
@@ -573,6 +574,7 @@ function PerimeterCanvas({
               e.preventDefault(); e.stopPropagation();
               dragExcludeRef.current = `v:${i}`;
               lockRef.current = effectiveTransform();
+              onVertexDragStart?.(i, x, y);
               setDraggingVertex(i);
             }}>
             <circle cx={tx(x)} cy={ty(y)} r={20} fill="transparent" stroke="none" />
@@ -1151,6 +1153,10 @@ export default function RoomLayoutPage() {
   const [viewPan,      setViewPan]      = useState<[number, number]>([0, 0]);
   const [originPt,     setOriginPt]     = useState<Point>([0, 0]);
   const [showLegend,   setShowLegend]   = useState(true);
+  const [snapOrtho,    setSnapOrtho]    = useState(false);
+  // Records the room-coordinate position of a vertex at pointer-down (before any movement).
+  // Used by the snap logic to determine the drag axis from actual drag direction.
+  const snapStartRef = useRef<{ vertexIdx: number; xIn: number; yIn: number } | null>(null);
 
   // ── Load ──────────────────────────────────────────────────────────────────
 
@@ -1313,12 +1319,40 @@ export default function RoomLayoutPage() {
     });
   }
 
+  /** Records the original room-coordinate position of a vertex when its drag begins. */
+  function handleVertexDragStart(vertexIdx: number, xIn: number, yIn: number) {
+    snapStartRef.current = { vertexIdx, xIn, yIn };
+  }
+
   /**
    * Called by PerimeterCanvas when any vertex is dragged to (newXIn, newYIn).
    * All vertices use the same logic: update the two segments that share the vertex.
    * Vertex 0 is stored as `originPt`; its adjacent segments update the same way.
    */
   function handleVertexDrag(vertexIdx: number, newXIn: number, newYIn: number) {
+    // ── Snap to 90° ─────────────────────────────────────────────────────────
+    if (snapOrtho) {
+      const pts  = computePoints(segments, originPt);
+      const start = snapStartRef.current;
+
+      if (vertexIdx === 0 && pts.length > 1) {
+        // Wall: segment 0 (vertex 0 → vertex 1). Fix vertex 1; snap vertex 0.
+        const [ax, ay] = pts[1];
+        // Axis from drag direction (start → current mouse), not from adjacent vertex.
+        const sdx = start?.vertexIdx === 0 ? newXIn - start.xIn : ax - newXIn;
+        const sdy = start?.vertexIdx === 0 ? newYIn - start.yIn : ay - newYIn;
+        if (Math.abs(sdx) >= Math.abs(sdy)) newYIn = ay; else newXIn = ax;
+      } else if (vertexIdx > 0 && vertexIdx - 1 < pts.length) {
+        // Wall: segment (v-1 → v). Fix vertex v-1; snap vertex v.
+        const [ax, ay] = pts[vertexIdx - 1];
+        // Axis from drag direction (start → current mouse) for immediate axis lock.
+        const sdx = start?.vertexIdx === vertexIdx ? newXIn - start.xIn : newXIn - ax;
+        const sdy = start?.vertexIdx === vertexIdx ? newYIn - start.yIn : newYIn - ay;
+        if (Math.abs(sdx) >= Math.abs(sdy)) newYIn = ay; else newXIn = ax;
+      }
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     if (vertexIdx === 0) {
       // Vertex 0 position is stored in originPt. Update it and adjust the two
       // adjacent segments so all other vertices stay exactly where they are.
@@ -1511,6 +1545,38 @@ export default function RoomLayoutPage() {
             </p>
           </div>
 
+          {/* Snap to 90° */}
+          <div style={{ ...DS.card, padding: "12px 16px" }}>
+            <p style={{ ...DS.cardTitle, marginBottom: "8px" }}>Drag Options</p>
+            <button
+              onClick={() => setSnapOrtho(v => !v)}
+              style={{
+                width: "100%", padding: "10px 14px",
+                fontSize: "13px", fontWeight: "700", textAlign: "left",
+                borderRadius: "7px", border: "2px solid",
+                backgroundColor: snapOrtho ? "#1a1a1a" : "#fff",
+                borderColor:     snapOrtho ? "#1a1a1a" : "#c8c4be",
+                color:           snapOrtho ? "#fff"    : "#1a1a1a",
+                cursor: "pointer", display: "flex", alignItems: "center", gap: "10px",
+              }}>
+              <span style={{
+                width: "18px", height: "18px", borderRadius: "50%", flexShrink: 0,
+                border: "2px solid", display: "inline-flex", alignItems: "center", justifyContent: "center",
+                borderColor: snapOrtho ? "#fff" : "#888",
+                backgroundColor: snapOrtho ? "#fff" : "transparent",
+              }}>
+                {snapOrtho && <span style={{ width: "8px", height: "8px", borderRadius: "50%", backgroundColor: "#1a1a1a" }} />}
+              </span>
+              <span>
+                Snap to 90°
+                <span style={{ display: "block", fontSize: "11px", fontWeight: "400",
+                  color: snapOrtho ? "#ccc" : "#888", marginTop: "1px" }}>
+                  {snapOrtho ? "ON — walls snap to 0 / 90 / 180 / 270°" : "OFF — free angle dragging"}
+                </span>
+              </span>
+            </button>
+          </div>
+
           {/* Wall list */}
           <div style={DS.card}>
             <div style={{ display: "flex", justifyContent: "space-between",
@@ -1635,6 +1701,7 @@ export default function RoomLayoutPage() {
                 </button>
               </div>
             </div>
+
             <div style={{ overflow: "hidden", borderRadius: "8px" }}>
               <PerimeterCanvas
                 segments={segments}
@@ -1642,6 +1709,7 @@ export default function RoomLayoutPage() {
                 onSelect={setSelectedId}
                 designRuns={designRuns}
                 onVertexDrag={handleVertexDrag}
+                onVertexDragStart={handleVertexDragStart}
                 onBreakpointDrag={handleBreakpointDrag}
                 onCurveDrag={handleCurveDrag}
                 onAnchorDrag={handleAnchorDrag}

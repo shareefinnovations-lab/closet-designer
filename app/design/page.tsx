@@ -3109,9 +3109,13 @@ export default function DesignPage() {
         } catch { /* fall through */ }
       }
 
-      const designed = new Set(newRuns.map(r => r.wallId));
-      for (const w of usableWalls) {
-        if (!designed.has(w.id)) newRuns.push(mkRun(w.id, w.widthIn));
+      const designed        = new Set(newRuns.map(r => r.wallId));
+      const undesignedWalls = usableWalls.filter(w => !designed.has(w.id));
+
+      if (undesignedWalls.length > 0) {
+        for (const w of undesignedWalls) {
+          newRuns.push(mkRun(w.id, w.widthIn));
+        }
       }
 
       seedId(newRuns);
